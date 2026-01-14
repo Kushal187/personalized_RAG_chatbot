@@ -118,7 +118,7 @@ def build_from_uploads(resume_file, personal_file, client: OpenAI):
                 f"Extracted empty text from {d['id']} PDF. If scanned/image-only, you need OCR."
             )
 
-        # Save extracted text to .txt (you requested this)
+        # Save extracted text to .txt 
         save_txt(d["txt"], text)
 
         # Dynamic chunking
