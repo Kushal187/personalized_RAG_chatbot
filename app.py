@@ -19,8 +19,7 @@ st.set_page_config(page_title="About Me RAG Chatbot", page_icon="💬", layout="
 
 
 
-# Helpersgit rm -r --cached .venv
-
+# Helpers
 def normalize_text(text: str) -> str:
     text = text.replace("\t", " ")
     text = re.sub(r"[ ]{2,}", " ", text)
@@ -155,10 +154,10 @@ def generate_answer(question: str, hits, client: OpenAI):
                 "role": "system",
                 "content": "Answer using only the provided context. If not present, say you do not have that information."
             },
-            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer concisely."},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
         ],
         temperature=0.4,
-        max_tokens=400,
+        max_tokens=500,
     )
     return resp.choices[0].message.content
 
