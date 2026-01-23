@@ -194,7 +194,7 @@ Do not invent or hallucinate information not present in the resume."""
 
 # Semantic chunking based on resume sections
 def identify_section_type(text: str) -> str:
-    text_lower = text.lower()[:500]  # Check beginning of chunk
+    text_lower = text.lower()[:500]
     if any(kw in text_lower for kw in ["experience", "work history", "employment", "professional background"]):
         return "experience"
     if any(kw in text_lower for kw in ["skill", "technologies", "tools", "proficiencies", "competencies", "technical"]):
@@ -208,175 +208,283 @@ def identify_section_type(text: str) -> str:
     return "other"
 
 
-def chunk_by_character_limit(text: str, metadata: ResumeMetadata, target_size: int = 800, overlap: int = 100) -> list[ChunkMetadata]:
-    """Fallback chunking by character count with sentence boundary awareness."""
+def extract_roles_from_experience(section_text: str) -> list[dict]:
+    """Extract individual roles/jobs from an experience section."""
+    roles = []
+    
+    # Pattern to match role entries - looks for:
+    # Title | Company | Location | Date patterns
+    # Common formats:
+    # "Software Engineer May 2025 - Present Meta Menlo Park, CA"
+    # "Software Engineer at Meta | May 2025 - Present"
+    # "Software Engineer, Meta (May 2025 - Present)"
+    
+    # Date patterns
+    date_pattern = r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*\d{4}'
+    date_range_pattern = rf'({date_pattern})\s*[-–—to]+\s*({date_pattern}|Present|Current)'
+    
+    # Split by date ranges (each role typically has a date range)
+    # Find all date range positions
+    matches = list(re.finditer(date_range_pattern, section_text, re.IGNORECASE))
+    
+    if not matches:
+        # No date ranges found, return whole section as one chunk
+        return [{"text": section_text, "company": None, "title": None}]
+    
+    # Extract roles based on date range positions
+    for i, match in enumerate(matches):
+        # Find the start of this role (either start of text or end of previous role's bullets)
+        if i == 0:
+            # Look backwards from date to find role title
+            role_start = 0
+            # Check if there's a section header before first role
+            lines_before = section_text[:match.start()].split('\n')
+            for j, line in enumerate(lines_before):
+                if line.strip().upper() in ['EXPERIENCE', 'WORK EXPERIENCE', 'PROFESSIONAL EXPERIENCE', 'EMPLOYMENT']:
+                    role_start = section_text.find(lines_before[j]) + len(lines_before[j])
+                    break
+        else:
+            # Start after previous role's content
+            role_start = prev_role_end
+        
+        # Find end of this role (start of next role or end of section)
+        if i + 1 < len(matches):
+            # Find where next role's title likely starts (look for line before next date)
+            next_match = matches[i + 1]
+            # Search backwards from next date to find the role title line
+            search_area = section_text[match.end():next_match.start()]
+            
+            # Look for a line that looks like a job title (not a bullet point)
+            lines = search_area.split('\n')
+            role_end = match.end()
+            for line in reversed(lines):
+                stripped = line.strip()
+                if stripped and not stripped.startswith(('•', '-', '*', '–', '▪')):
+                    # This might be the next role's title
+                    title_pos = section_text.find(stripped, match.end())
+                    if title_pos > 0:
+                        role_end = title_pos
+                        break
+                role_end += len(line) + 1
+            
+            prev_role_end = role_end
+        else:
+            role_end = len(section_text)
+            prev_role_end = role_end
+        
+        role_text = section_text[role_start:role_end].strip()
+        
+        # Try to extract company name from the role text
+        company = None
+        # Look for company names in metadata.companies or extract from text
+        first_line = role_text.split('\n')[0] if role_text else ""
+        
+        roles.append({
+            "text": role_text,
+            "company": company,
+            "title": first_line[:100] if first_line else None,
+            "date_range": match.group(0)
+        })
+    
+    return roles
+
+
+def extract_entries_from_section(section_text: str, section_type: str) -> list[str]:
+    """Extract individual entries (roles, projects, education) from a section."""
+    
+    if section_type == "experience":
+        roles = extract_roles_from_experience(section_text)
+        return [r["text"] for r in roles if r["text"].strip()]
+    
+    elif section_type == "projects":
+        # Split projects by project headers (usually Name | Tech Stack | Date)
+        # Look for lines that start a new project (not bullet points)
+        entries = []
+        current_entry = []
+        lines = section_text.split('\n')
+        
+        for line in lines:
+            stripped = line.strip()
+            # Detect project header: not a bullet, contains | or tech keywords
+            is_project_header = (
+                stripped and 
+                not stripped.startswith(('•', '-', '*', '–', '▪')) and
+                (
+                    '|' in stripped or 
+                    re.search(r'(?:Python|Java|React|Node|Flask|Django|AWS|Docker)', stripped, re.IGNORECASE)
+                ) and
+                len(stripped.split()) >= 2
+            )
+            
+            if is_project_header and current_entry:
+                entries.append('\n'.join(current_entry))
+                current_entry = [line]
+            else:
+                current_entry.append(line)
+        
+        if current_entry:
+            entries.append('\n'.join(current_entry))
+        
+        # Filter out section header if it's the only "entry"
+        entries = [e.strip() for e in entries if e.strip() and len(e.strip()) > 20]
+        return entries if entries else [section_text]
+    
+    elif section_type == "education":
+        # Split by university/school names or degree entries
+        entries = []
+        current_entry = []
+        lines = section_text.split('\n')
+        
+        for line in lines:
+            stripped = line.strip()
+            # Detect education header: contains university/college keywords or degree
+            is_edu_header = (
+                stripped and
+                not stripped.startswith(('•', '-', '*', '–', '▪')) and
+                (
+                    re.search(r'(?:University|College|Institute|School|Bachelor|Master|PhD|B\.S\.|M\.S\.|B\.A\.|M\.A\.)', stripped, re.IGNORECASE)
+                )
+            )
+            
+            if is_edu_header and current_entry and any(c.strip() for c in current_entry):
+                entries.append('\n'.join(current_entry))
+                current_entry = [line]
+            else:
+                current_entry.append(line)
+        
+        if current_entry:
+            entries.append('\n'.join(current_entry))
+        
+        entries = [e.strip() for e in entries if e.strip() and len(e.strip()) > 20]
+        return entries if entries else [section_text]
+    
+    # For other sections (skills, summary, etc.), keep as single chunk
+    return [section_text]
+
+
+def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMetadata]:
+    """Chunk resume by sections and individual entries (roles, projects, etc.)."""
+    text = normalize_text(text)
+    
+    # Section header patterns
+    section_headers = [
+        r'^\s*(EXPERIENCE|WORK EXPERIENCE|PROFESSIONAL EXPERIENCE|EMPLOYMENT HISTORY)',
+        r'^\s*(EDUCATION|ACADEMIC BACKGROUND)',
+        r'^\s*(SKILLS|TECHNICAL SKILLS|TECHNOLOGIES|CORE COMPETENCIES)',
+        r'^\s*(PROJECTS|PERSONAL PROJECTS|ACADEMIC PROJECTS|SIDE PROJECTS)',
+        r'^\s*(SUMMARY|PROFESSIONAL SUMMARY|OBJECTIVE|PROFILE|ABOUT ME)',
+        r'^\s*(CERTIFICATIONS?|LICENSES?|AWARDS?|HONORS?|ACHIEVEMENTS?)',
+        r'^\s*(PUBLICATIONS?|RESEARCH|PAPERS)',
+        r'^\s*(LEADERSHIP|ACTIVITIES|EXTRACURRICULAR)',
+    ]
+    combined_pattern = '|'.join(section_headers)
+    
+    # Parse into sections
+    lines = text.split('\n')
+    sections = []
+    current_section_lines = []
+    current_section_type = "header"
+    
+    for line in lines:
+        stripped = line.strip()
+        is_section_header = False
+        
+        if stripped:
+            if re.match(combined_pattern, stripped, re.IGNORECASE):
+                is_section_header = True
+            elif stripped.isupper() and 2 <= len(stripped.split()) <= 5 and len(stripped) > 3:
+                # Likely a section header
+                is_section_header = True
+        
+        if is_section_header:
+            # Save previous section
+            if current_section_lines:
+                section_text = '\n'.join(current_section_lines).strip()
+                if section_text:
+                    sections.append((current_section_type, section_text))
+            current_section_lines = [line]
+            current_section_type = identify_section_type(stripped)
+        else:
+            current_section_lines.append(line)
+    
+    # Save last section
+    if current_section_lines:
+        section_text = '\n'.join(current_section_lines).strip()
+        if section_text:
+            sections.append((current_section_type, section_text))
+    
+    # Create chunks from sections
     chunks = []
     chunk_id = 0
     
-    # Split into sentences (roughly)
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    
-    current_chunk = ""
-    for sentence in sentences:
-        if len(current_chunk) + len(sentence) < target_size:
-            current_chunk += " " + sentence if current_chunk else sentence
-        else:
-            if current_chunk and len(current_chunk.strip()) > 50:  # Min chunk size
+    for section_type, section_text in sections:
+        # Extract individual entries from the section
+        entries = extract_entries_from_section(section_text, section_type)
+        
+        for entry in entries:
+            entry = entry.strip()
+            if not entry or len(entry) < 50:
+                continue
+            
+            # If entry is still too long (>1500 chars), split by sentences
+            if len(entry) > 1500:
+                sentences = re.split(r'(?<=[.!?])\s+', entry)
+                current_chunk = ""
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) < 1200:
+                        current_chunk += " " + sentence if current_chunk else sentence
+                    else:
+                        if current_chunk:
+                            chunk_id += 1
+                            chunks.append(ChunkMetadata(
+                                person_name=metadata.person_name,
+                                source_file=metadata.source_file,
+                                chunk_id=chunk_id,
+                                chunk_type=section_type,
+                                skills=",".join(metadata.skills[:10]),
+                                companies=",".join(metadata.companies[:5]),
+                                experience_years=metadata.experience_years or 0,
+                                text=current_chunk.strip()
+                            ))
+                        current_chunk = sentence
+                if current_chunk:
+                    chunk_id += 1
+                    chunks.append(ChunkMetadata(
+                        person_name=metadata.person_name,
+                        source_file=metadata.source_file,
+                        chunk_id=chunk_id,
+                        chunk_type=section_type,
+                        skills=",".join(metadata.skills[:10]),
+                        companies=",".join(metadata.companies[:5]),
+                        experience_years=metadata.experience_years or 0,
+                        text=current_chunk.strip()
+                    ))
+            else:
                 chunk_id += 1
                 chunks.append(ChunkMetadata(
                     person_name=metadata.person_name,
                     source_file=metadata.source_file,
                     chunk_id=chunk_id,
-                    chunk_type=identify_section_type(current_chunk),
+                    chunk_type=section_type,
                     skills=",".join(metadata.skills[:10]),
                     companies=",".join(metadata.companies[:5]),
                     experience_years=metadata.experience_years or 0,
-                    text=current_chunk.strip()
+                    text=entry
                 ))
-            # Start new chunk with overlap from end of previous
-            overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else ""
-            current_chunk = overlap_text + " " + sentence
     
-    # Don't forget the last chunk
-    if current_chunk and len(current_chunk.strip()) > 50:
+    # Fallback if no chunks created
+    if not chunks:
         chunk_id += 1
         chunks.append(ChunkMetadata(
             person_name=metadata.person_name,
             source_file=metadata.source_file,
             chunk_id=chunk_id,
-            chunk_type=identify_section_type(current_chunk),
+            chunk_type="other",
             skills=",".join(metadata.skills[:10]),
             companies=",".join(metadata.companies[:5]),
             experience_years=metadata.experience_years or 0,
-            text=current_chunk.strip()
+            text=text[:2000]  # First 2000 chars as fallback
         ))
-    
-    return chunks
-
-
-def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMetadata]:
-    """Chunk resume by sections, with consistent sizing."""
-    text = normalize_text(text)
-    
-    # More specific section header pattern - requires header to be on its own line
-    # Matches: "EXPERIENCE", "Work Experience:", "SKILLS & TECHNOLOGIES", etc.
-    section_headers = [
-        r'^\s*(EXPERIENCE|WORK EXPERIENCE|PROFESSIONAL EXPERIENCE|EMPLOYMENT)',
-        r'^\s*(EDUCATION|ACADEMIC)',
-        r'^\s*(SKILLS|TECHNICAL SKILLS|TECHNOLOGIES|COMPETENCIES)',
-        r'^\s*(PROJECTS|PERSONAL PROJECTS|ACADEMIC PROJECTS)',
-        r'^\s*(SUMMARY|PROFESSIONAL SUMMARY|OBJECTIVE|PROFILE|ABOUT)',
-        r'^\s*(CERTIFICATIONS?|LICENSES?|AWARDS?|HONORS?)',
-        r'^\s*(PUBLICATIONS?|RESEARCH)',
-    ]
-    combined_pattern = '|'.join(section_headers)
-    
-    # Split by lines first, then identify section boundaries
-    lines = text.split('\n')
-    sections = []
-    current_section = []
-    current_header = "header"
-    
-    for line in lines:
-        # Check if this line is a section header
-        is_header = False
-        if line.strip():
-            # Check against known patterns
-            if re.match(combined_pattern, line.strip(), re.IGNORECASE):
-                is_header = True
-            # Also check for standalone ALL CAPS short lines (likely headers)
-            elif line.strip().isupper() and len(line.strip().split()) <= 4 and len(line.strip()) > 3:
-                is_header = True
-        
-        if is_header and current_section:
-            # Save previous section
-            section_text = '\n'.join(current_section).strip()
-            if section_text:
-                sections.append((current_header, section_text))
-            current_section = [line]
-            current_header = identify_section_type(line)
-        else:
-            current_section.append(line)
-    
-    # Don't forget last section
-    if current_section:
-        section_text = '\n'.join(current_section).strip()
-        if section_text:
-            sections.append((current_header, section_text))
-    
-    # Now create chunks from sections
-    chunks = []
-    chunk_id = 0
-    
-    TARGET_CHUNK_SIZE = 600  # characters
-    MAX_CHUNK_SIZE = 1000
-    MIN_CHUNK_SIZE = 150
-    
-    for section_type, section_text in sections:
-        # If section is small enough, keep as one chunk
-        if len(section_text) <= MAX_CHUNK_SIZE:
-            if len(section_text) >= MIN_CHUNK_SIZE:
-                chunk_id += 1
-                chunks.append(ChunkMetadata(
-                    person_name=metadata.person_name,
-                    source_file=metadata.source_file,
-                    chunk_id=chunk_id,
-                    chunk_type=section_type,
-                    skills=",".join(metadata.skills[:10]),
-                    companies=",".join(metadata.companies[:5]),
-                    experience_years=metadata.experience_years or 0,
-                    text=section_text
-                ))
-        else:
-            # Split large sections by paragraphs or bullet points
-            # Try to split on double newlines or bullet patterns
-            subsections = re.split(r'\n\n+|\n(?=[\•\-\*\▪])', section_text)
-            
-            current_chunk = ""
-            for subsection in subsections:
-                subsection = subsection.strip()
-                if not subsection:
-                    continue
-                    
-                if len(current_chunk) + len(subsection) < TARGET_CHUNK_SIZE:
-                    current_chunk += "\n\n" + subsection if current_chunk else subsection
-                else:
-                    # Save current chunk if it's substantial
-                    if len(current_chunk) >= MIN_CHUNK_SIZE:
-                        chunk_id += 1
-                        chunks.append(ChunkMetadata(
-                            person_name=metadata.person_name,
-                            source_file=metadata.source_file,
-                            chunk_id=chunk_id,
-                            chunk_type=section_type,
-                            skills=",".join(metadata.skills[:10]),
-                            companies=",".join(metadata.companies[:5]),
-                            experience_years=metadata.experience_years or 0,
-                            text=current_chunk
-                        ))
-                    current_chunk = subsection
-            
-            # Last chunk from this section
-            if current_chunk and len(current_chunk) >= MIN_CHUNK_SIZE:
-                chunk_id += 1
-                chunks.append(ChunkMetadata(
-                    person_name=metadata.person_name,
-                    source_file=metadata.source_file,
-                    chunk_id=chunk_id,
-                    chunk_type=section_type,
-                    skills=",".join(metadata.skills[:10]),
-                    companies=",".join(metadata.companies[:5]),
-                    experience_years=metadata.experience_years or 0,
-                    text=current_chunk
-                ))
-    
-    # If no chunks created (weird formatting), fall back to character-based chunking
-    if not chunks:
-        return chunk_by_character_limit(text, metadata)
-    
-    # If only 1 chunk but text is long, also fall back
-    if len(chunks) == 1 and len(text) > MAX_CHUNK_SIZE * 2:
-        return chunk_by_character_limit(text, metadata)
     
     return chunks
 
@@ -432,9 +540,13 @@ def build_collection(chunks: list[ChunkMetadata], chroma_client, openai_client: 
 
 
 # Query rewriting with context
-def rewrite_query(query: str, conversation_history: list[dict], client: OpenAI) -> str:
+def rewrite_query(query: str, conversation_history: list[dict], client: OpenAI) -> tuple[str, Optional[str], bool]:
+    """
+    Rewrite query with context and extract person name if mentioned.
+    Returns: (rewritten_query, detected_person_name or None, is_multi_person_query)
+    """
     if not conversation_history:
-        return query
+        return query, None, False
     
     # Format recent conversation
     recent = conversation_history[-MAX_CONTEXT_TURNS * 2:]  # Last 5 Q&A pairs
@@ -447,18 +559,28 @@ def rewrite_query(query: str, conversation_history: list[dict], client: OpenAI) 
 Given the conversation history and the new query, rewrite the query to be self-contained and specific.
 
 Rules:
-1. If the query references "them", "that person", "he/she" etc., replace with the actual name from context
+1. If the query references "them", "that person", "he/she", "his/her" etc., replace with the actual name from context
 2. If the query asks for "more details" or "what else", specify what information to look for
 3. If the query is already self-contained, return it unchanged
 4. Keep the rewritten query concise
-5. Return ONLY the rewritten query, nothing else
+
+Return JSON with exactly these fields:
+{{
+  "rewritten_query": "the rewritten query",
+  "person_name": "full name if query is about a SINGLE specific person, otherwise null",
+  "is_multi_person": true/false (true if query asks about multiple people or compares candidates)
+}}
+
+IMPORTANT: 
+- If the query uses "their", "them", "all", "everyone", "candidates", "compare" or asks about multiple people, set person_name to null and is_multi_person to true
+- Only set person_name if the query is clearly about ONE specific person
 
 Conversation history:
 {history}
 
 New query: {query}
 
-Rewritten query:"""
+JSON response:"""
 
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
@@ -466,10 +588,60 @@ Rewritten query:"""
             {"role": "user", "content": rewrite_prompt.format(history=history_text, query=query)}
         ],
         temperature=0,
-        max_tokens=200
+        max_tokens=200,
+        response_format={"type": "json_object"}
     )
     
-    return resp.choices[0].message.content.strip()
+    try:
+        result = json.loads(resp.choices[0].message.content)
+        return (
+            result.get("rewritten_query", query), 
+            result.get("person_name"),
+            result.get("is_multi_person", False)
+        )
+    except json.JSONDecodeError:
+        return resp.choices[0].message.content.strip(), None, False
+
+
+def detect_person_in_query(query: str, known_names: list[str]) -> tuple[Optional[str], bool]:
+    """
+    Check if query mentions known person names.
+    Returns: (single_person_name or None, is_multi_person)
+    """
+    query_lower = query.lower()
+    
+    # Check for multi-person indicators
+    multi_person_keywords = ['their', 'them', 'all', 'everyone', 'candidates', 'compare', 'both', 'each']
+    is_multi = any(kw in query_lower for kw in multi_person_keywords)
+    
+    # Count how many people are mentioned
+    mentioned_people = []
+    for name in known_names:
+        name_lower = name.lower()
+        # Check full name
+        if name_lower in query_lower:
+            mentioned_people.append(name)
+            continue
+        # Check first name and last name separately (but need at least 3 chars)
+        name_parts = name.split()
+        for part in name_parts:
+            if len(part) > 2 and part.lower() in query_lower.split():
+                mentioned_people.append(name)
+                break
+    
+    # If multiple people mentioned, it's a multi-person query
+    if len(mentioned_people) > 1:
+        return None, True
+    
+    # If multi-person keywords present, don't filter even if one name mentioned
+    if is_multi:
+        return None, True
+    
+    # Single person mentioned
+    if len(mentioned_people) == 1:
+        return mentioned_people[0], False
+    
+    return None, False
 
 
 # Retrieval with filtering
@@ -766,7 +938,7 @@ if query := st.chat_input("Ask about the candidates..."):
         with st.chat_message("assistant"):
             with st.spinner("Searching..."):
                 # Rewrite query with context
-                rewritten_query = rewrite_query(
+                rewritten_query, detected_person, is_multi_person = rewrite_query(
                     query,
                     st.session_state.messages[:-1],  # Exclude current query
                     client
@@ -776,8 +948,31 @@ if query := st.chat_input("Ask about the candidates..."):
                 if rewritten_query.lower() != query.lower():
                     st.caption(f"🔄 Searching for: {rewritten_query}")
                 
-                # Apply filters
-                p_filter = None if person_filter == "All" else person_filter
+                # Auto-detect person from query if not detected by rewriter
+                known_names = list(st.session_state.resume_metadata.keys())
+                
+                if is_multi_person:
+                    # Multi-person query - don't filter
+                    p_filter = None
+                    st.caption(f"👥 Searching across all {len(known_names)} candidates")
+                elif detected_person and detected_person in known_names:
+                    # Single person detected by rewriter
+                    p_filter = detected_person
+                    st.caption(f"👤 Filtering for: {detected_person}")
+                else:
+                    # Try to detect from query text
+                    auto_detected, auto_multi = detect_person_in_query(rewritten_query, known_names)
+                    if auto_multi:
+                        p_filter = None
+                        st.caption(f"👥 Searching across all {len(known_names)} candidates")
+                    elif auto_detected:
+                        p_filter = auto_detected
+                        st.caption(f"👤 Filtering for: {auto_detected}")
+                    elif person_filter != "All":
+                        p_filter = person_filter
+                    else:
+                        p_filter = None
+                
                 s_filter = skill_filter if skill_filter else None
                 m_exp = min_exp if min_exp > 0 else None
                 
@@ -818,7 +1013,7 @@ if query := st.chat_input("Ask about the candidates..."):
                     with st.expander("📚 Sources"):
                         for h in hits:
                             st.markdown(f"**{h['person_name']}** ({h['chunk_type']})")
-                            st.caption(h['text'][:200] + "...")
+                            st.caption(h['text'][:300] + "..." if len(h['text']) > 300 else h['text'])
                             st.divider()
                 
                 st.session_state.messages.append({"role": "assistant", "content": answer})
