@@ -540,11 +540,35 @@ def build_collection(chunks: list[ChunkMetadata], chroma_client, openai_client: 
 
 
 # Query rewriting with context
-def rewrite_query(query: str, conversation_history: list[dict], client: OpenAI) -> tuple[str, Optional[str], bool]:
+def rewrite_query(query: str, conversation_history: list[dict], known_names: list[str], client: OpenAI) -> tuple[str, Optional[str], bool]:
     """
     Rewrite query with context and extract person name if mentioned.
     Returns: (rewritten_query, detected_person_name or None, is_multi_person_query)
     """
+    
+    # First, check if the query explicitly mentions a known person
+    # If so, DON'T let the rewriter change it
+    explicit_person, is_multi = detect_person_in_query(query, known_names)
+    
+    if explicit_person:
+        # Query already has an explicit name - don't rewrite the person
+        return query, explicit_person, False
+    
+    if is_multi:
+        # Multiple people mentioned or multi-person keywords
+        return query, None, True
+    
+    # No explicit person in query - check if we need to resolve pronouns/references
+    pronouns_and_refs = ['he', 'she', 'his', 'her', 'him', 'they', 'their', 'them', 
+                         'that person', 'that candidate', 'there', 'that company', 
+                         'that role', 'that job', 'this person', 'this candidate']
+    query_lower = query.lower()
+    has_reference = any(f' {p} ' in f' {query_lower} ' or query_lower.startswith(f'{p} ') or query_lower.endswith(f' {p}') for p in pronouns_and_refs)
+    
+    if not has_reference and not conversation_history:
+        # No pronouns and no history - return as is
+        return query, None, False
+    
     if not conversation_history:
         return query, None, False
     
@@ -556,24 +580,28 @@ def rewrite_query(query: str, conversation_history: list[dict], client: OpenAI) 
     ])
     
     rewrite_prompt = """You are a query rewriter for a resume search system. 
-Given the conversation history and the new query, rewrite the query to be self-contained and specific.
+Given the conversation history and the new query, rewrite the query to be FULLY self-contained.
 
-Rules:
-1. If the query references "them", "that person", "he/she", "his/her" etc., replace with the actual name from context
-2. If the query asks for "more details" or "what else", specify what information to look for
-3. If the query is already self-contained, return it unchanged
-4. Keep the rewritten query concise
+CRITICAL RULES:
+1. Replace ALL pronouns (he/she/his/her/they/their/them) with actual names from conversation history
+2. Replace ALL contextual references like "there", "that company", "that role", "it" with the actual entity from context
+3. If the query already contains a person's name, DO NOT change it to a different person
+4. If the query asks about "their", "them", "all", "everyone", or "candidates", it's asking about multiple people
+5. The rewritten query must be understandable WITHOUT any conversation history
+
+Known candidates: {known_names}
 
 Return JSON with exactly these fields:
 {{
-  "rewritten_query": "the rewritten query",
+  "rewritten_query": "the fully self-contained rewritten query",
   "person_name": "full name if query is about a SINGLE specific person, otherwise null",
-  "is_multi_person": true/false (true if query asks about multiple people or compares candidates)
+  "is_multi_person": true/false (true if query asks about multiple people)
 }}
 
-IMPORTANT: 
-- If the query uses "their", "them", "all", "everyone", "candidates", "compare" or asks about multiple people, set person_name to null and is_multi_person to true
-- Only set person_name if the query is clearly about ONE specific person
+Examples:
+- "what did he do there" after discussing John at Google → "what did John do at Google"
+- "tell me more about his skills" after discussing Jane → "tell me more about Jane's skills"
+- "what is their experience" → is_multi_person: true
 
 Conversation history:
 {history}
@@ -585,7 +613,11 @@ JSON response:"""
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
-            {"role": "user", "content": rewrite_prompt.format(history=history_text, query=query)}
+            {"role": "user", "content": rewrite_prompt.format(
+                history=history_text, 
+                query=query,
+                known_names=", ".join(known_names)
+            )}
         ],
         temperature=0,
         max_tokens=200,
@@ -594,13 +626,19 @@ JSON response:"""
     
     try:
         result = json.loads(resp.choices[0].message.content)
-        return (
-            result.get("rewritten_query", query), 
-            result.get("person_name"),
-            result.get("is_multi_person", False)
-        )
+        rewritten = result.get("rewritten_query", query)
+        person = result.get("person_name")
+        is_multi = result.get("is_multi_person", False)
+        
+        # Safety check: if original query mentioned a name, don't let rewriter change it
+        original_person, _ = detect_person_in_query(query, known_names)
+        if original_person and person != original_person:
+            # Rewriter tried to change the person - override
+            return query, original_person, False
+        
+        return rewritten, person, is_multi
     except json.JSONDecodeError:
-        return resp.choices[0].message.content.strip(), None, False
+        return query, None, False
 
 
 def detect_person_in_query(query: str, known_names: list[str]) -> tuple[Optional[str], bool]:
@@ -612,7 +650,7 @@ def detect_person_in_query(query: str, known_names: list[str]) -> tuple[Optional
     
     # Check for multi-person indicators
     multi_person_keywords = ['their', 'them', 'all', 'everyone', 'candidates', 'compare', 'both', 'each']
-    is_multi = any(kw in query_lower for kw in multi_person_keywords)
+    is_multi = any(f' {kw} ' in f' {query_lower} ' or query_lower.startswith(f'{kw} ') for kw in multi_person_keywords)
     
     # Count how many people are mentioned
     mentioned_people = []
@@ -622,12 +660,17 @@ def detect_person_in_query(query: str, known_names: list[str]) -> tuple[Optional
         if name_lower in query_lower:
             mentioned_people.append(name)
             continue
-        # Check first name and last name separately (but need at least 3 chars)
+        # Check individual parts of name (first name, last name)
         name_parts = name.split()
         for part in name_parts:
-            if len(part) > 2 and part.lower() in query_lower.split():
-                mentioned_people.append(name)
-                break
+            # Need at least 3 chars and must be a whole word
+            if len(part) > 2:
+                # Check as whole word
+                pattern = rf'\b{re.escape(part.lower())}\b'
+                if re.search(pattern, query_lower):
+                    if name not in mentioned_people:
+                        mentioned_people.append(name)
+                    break
     
     # If multiple people mentioned, it's a multi-person query
     if len(mentioned_people) > 1:
@@ -670,9 +713,10 @@ def retrieve_with_filters(
     elif len(where_clauses) > 1:
         where = {"$and": where_clauses}
     
+    # Retrieve more results initially to allow for post-filtering
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=k,
+        n_results=min(k * 2, 20),  # Get more to filter from
         where=where,
         include=["documents", "metadatas", "distances"]
     )
@@ -684,7 +728,7 @@ def retrieve_with_filters(
             results["metadatas"][0],
             results["distances"][0]
         ):
-            # Post-filter by skill if specified (ChromaDB doesn't support contains well)
+            # Post-filter by skill if specified
             if skill_filter:
                 if skill_filter.lower() not in meta.get("skills", "").lower():
                     continue
@@ -697,6 +741,9 @@ def retrieve_with_filters(
                 "skills": meta.get("skills"),
                 "distance": dist
             })
+            
+            if len(hits) >= k:
+                break
     
     return hits
 
@@ -837,9 +884,20 @@ with st.sidebar:
         if "all_chunks" in st.session_state:
             st.write(f"Total chunks: {len(st.session_state.all_chunks)}")
             for chunk in st.session_state.all_chunks:
-                st.write(f"**{chunk.person_name}** - {chunk.chunk_type}")
-                st.caption(chunk.text[:300])
+                st.write(f"**{chunk.person_name}** - {chunk.chunk_type} ({len(chunk.text)} chars)")
+                st.caption(chunk.text[:500] + "..." if len(chunk.text) > 500 else chunk.text)
                 st.divider()
+    
+    # DEBUG: Search specific text in chunks
+    debug_search = st.text_input("🔎 Debug: Search in chunks", key="debug_search")
+    if debug_search and "all_chunks" in st.session_state:
+        matches = [c for c in st.session_state.all_chunks if debug_search.lower() in c.text.lower()]
+        st.write(f"Found {len(matches)} chunks containing '{debug_search}':")
+        for chunk in matches:
+            st.write(f"**{chunk.person_name}** - {chunk.chunk_type}")
+            # Highlight the search term
+            st.caption(chunk.text[:500])
+            st.divider()
     
     st.divider()
     
@@ -937,10 +995,14 @@ if query := st.chat_input("Ask about the candidates..."):
     else:
         with st.chat_message("assistant"):
             with st.spinner("Searching..."):
+                # Get known names first
+                known_names = list(st.session_state.resume_metadata.keys())
+                
                 # Rewrite query with context
                 rewritten_query, detected_person, is_multi_person = rewrite_query(
                     query,
                     st.session_state.messages[:-1],  # Exclude current query
+                    known_names,
                     client
                 )
                 
@@ -948,30 +1010,18 @@ if query := st.chat_input("Ask about the candidates..."):
                 if rewritten_query.lower() != query.lower():
                     st.caption(f"🔄 Searching for: {rewritten_query}")
                 
-                # Auto-detect person from query if not detected by rewriter
-                known_names = list(st.session_state.resume_metadata.keys())
-                
                 if is_multi_person:
                     # Multi-person query - don't filter
                     p_filter = None
                     st.caption(f"👥 Searching across all {len(known_names)} candidates")
                 elif detected_person and detected_person in known_names:
-                    # Single person detected by rewriter
+                    # Single person detected
                     p_filter = detected_person
                     st.caption(f"👤 Filtering for: {detected_person}")
+                elif person_filter != "All":
+                    p_filter = person_filter
                 else:
-                    # Try to detect from query text
-                    auto_detected, auto_multi = detect_person_in_query(rewritten_query, known_names)
-                    if auto_multi:
-                        p_filter = None
-                        st.caption(f"👥 Searching across all {len(known_names)} candidates")
-                    elif auto_detected:
-                        p_filter = auto_detected
-                        st.caption(f"👤 Filtering for: {auto_detected}")
-                    elif person_filter != "All":
-                        p_filter = person_filter
-                    else:
-                        p_filter = None
+                    p_filter = None
                 
                 s_filter = skill_filter if skill_filter else None
                 m_exp = min_exp if min_exp > 0 else None
