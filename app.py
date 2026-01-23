@@ -572,12 +572,31 @@ def rewrite_query(query: str, conversation_history: list[dict], known_names: lis
     if not conversation_history:
         return query, None, False
     
-    # Format recent conversation
+    # Format recent conversation - keep most recent at the bottom for clarity
     recent = conversation_history[-MAX_CONTEXT_TURNS * 2:]  # Last 5 Q&A pairs
-    history_text = "\n".join([
-        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:500]}"
-        for m in recent
-    ])
+    history_parts = []
+    for m in recent:
+        role = "User" if m["role"] == "user" else "Assistant"
+        # For assistant messages, extract the key person mentioned (if any)
+        content = m["content"][:600]
+        history_parts.append(f"{role}: {content}")
+    
+    history_text = "\n\n".join(history_parts)
+    
+    # Also extract who was mentioned in the LAST assistant response
+    last_assistant_msg = None
+    for m in reversed(conversation_history):
+        if m["role"] == "assistant":
+            last_assistant_msg = m["content"]
+            break
+    
+    # Add a hint about who was last discussed
+    last_person_hint = ""
+    if last_assistant_msg:
+        for name in known_names:
+            if name.lower() in last_assistant_msg.lower()[:500]:
+                last_person_hint = f"\n\nNOTE: The last assistant response primarily discussed: {name}"
+                break
     
     rewrite_prompt = """You are a query rewriter for a resume search system. 
 Given the conversation history and the new query, rewrite the query to be FULLY self-contained.
@@ -585,9 +604,12 @@ Given the conversation history and the new query, rewrite the query to be FULLY 
 CRITICAL RULES:
 1. Replace ALL pronouns (he/she/his/her/they/their/them) with actual names from conversation history
 2. Replace ALL contextual references like "there", "that company", "that role", "it" with the actual entity from context
-3. If the query already contains a person's name, DO NOT change it to a different person
-4. If the query asks about "their", "them", "all", "everyone", or "candidates", it's asking about multiple people
-5. The rewritten query must be understandable WITHOUT any conversation history
+3. When resolving pronouns like "his" or "her", look at the MOST RECENT exchange to determine who is being referenced
+4. If the query already contains a person's name, DO NOT change it to a different person
+5. If the query asks about "their", "them", "all", "everyone", or "candidates", it's asking about multiple people
+6. The rewritten query must be understandable WITHOUT any conversation history
+
+IMPORTANT: Pay attention to the LAST question and answer pair. If the last answer primarily discussed a specific person, pronouns in the new query likely refer to THAT person, not someone mentioned earlier in the conversation.
 
 Known candidates: {known_names}
 
@@ -601,9 +623,10 @@ Return JSON with exactly these fields:
 Examples:
 - "what did he do there" after discussing John at Google → "what did John do at Google"
 - "tell me more about his skills" after discussing Jane → "tell me more about Jane's skills"
+- "what are his skills" after answer mentioning Bob has Salesforce experience → "what are Bob's skills"
 - "what is their experience" → is_multi_person: true
 
-Conversation history:
+Conversation history (MOST RECENT AT THE BOTTOM):
 {history}
 
 New query: {query}
@@ -614,7 +637,7 @@ JSON response:"""
         model=CHAT_MODEL,
         messages=[
             {"role": "user", "content": rewrite_prompt.format(
-                history=history_text, 
+                history=history_text + last_person_hint, 
                 query=query,
                 known_names=", ".join(known_names)
             )}
