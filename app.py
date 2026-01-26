@@ -331,6 +331,7 @@ def extract_entries_from_section(section_text: str, section_type: str) -> list[s
     
     elif section_type == "education":
         # Split by university/school names or degree entries
+        # Be more careful here - don't lose small entries
         entries = []
         current_entry = []
         lines = section_text.split('\n')
@@ -342,20 +343,41 @@ def extract_entries_from_section(section_text: str, section_type: str) -> list[s
                 stripped and
                 not stripped.startswith(('•', '-', '*', '–', '▪')) and
                 (
-                    re.search(r'(?:University|College|Institute|School|Bachelor|Master|PhD|B\.S\.|M\.S\.|B\.A\.|M\.A\.)', stripped, re.IGNORECASE)
+                    re.search(r'(?:University|College|Institute|School|Bachelor|Master|PhD|B\.S\.|M\.S\.|B\.A\.|M\.A\.|B\.Tech|M\.Tech|B\.E\.|M\.E\.)', stripped, re.IGNORECASE)
                 )
             )
             
             if is_edu_header and current_entry and any(c.strip() for c in current_entry):
-                entries.append('\n'.join(current_entry))
+                entry_text = '\n'.join(current_entry).strip()
+                if entry_text:
+                    entries.append(entry_text)
                 current_entry = [line]
             else:
                 current_entry.append(line)
         
         if current_entry:
-            entries.append('\n'.join(current_entry))
+            entry_text = '\n'.join(current_entry).strip()
+            if entry_text:
+                entries.append(entry_text)
         
-        entries = [e.strip() for e in entries if e.strip() and len(e.strip()) > 20]
+        # For education, keep even small entries (universities might be just 1-2 lines)
+        # But filter out very tiny ones (less than 10 chars)
+        entries = [e.strip() for e in entries if e.strip() and len(e.strip()) > 10]
+        
+        # If we split into multiple entries, combine very small adjacent entries
+        if len(entries) > 1:
+            combined = []
+            i = 0
+            while i < len(entries):
+                entry = entries[i]
+                # If this entry is very short, try to combine with next
+                while len(entry) < 100 and i + 1 < len(entries):
+                    i += 1
+                    entry = entry + "\n" + entries[i]
+                combined.append(entry)
+                i += 1
+            entries = combined
+        
         return entries if entries else [section_text]
     
     # For other sections (skills, summary, etc.), keep as single chunk
@@ -423,7 +445,12 @@ def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMeta
         
         for entry in entries:
             entry = entry.strip()
-            if not entry or len(entry) < 50:
+            
+            # Different minimum sizes for different section types
+            # Education entries can be short (just school + degree + date)
+            min_size = 30 if section_type == "education" else 50
+            
+            if not entry or len(entry) < min_size:
                 continue
             
             # If entry is still too long (>1500 chars), split by sentences
@@ -572,72 +599,100 @@ def rewrite_query(query: str, conversation_history: list[dict], known_names: lis
     if not conversation_history:
         return query, None, False
     
-    # Format recent conversation - keep most recent at the bottom for clarity
-    recent = conversation_history[-MAX_CONTEXT_TURNS * 2:]  # Last 5 Q&A pairs
-    history_parts = []
-    for m in recent:
-        role = "User" if m["role"] == "user" else "Assistant"
-        # For assistant messages, extract the key person mentioned (if any)
-        content = m["content"][:600]
-        history_parts.append(f"{role}: {content}")
-    
-    history_text = "\n\n".join(history_parts)
-    
-    # Also extract who was mentioned in the LAST assistant response
+    # For pronoun resolution, we primarily care about the LAST exchange
+    # Get the last Q&A pair
+    last_user_msg = None
     last_assistant_msg = None
+    
     for m in reversed(conversation_history):
-        if m["role"] == "assistant":
+        if m["role"] == "assistant" and last_assistant_msg is None:
             last_assistant_msg = m["content"]
+        elif m["role"] == "user" and last_user_msg is None:
+            last_user_msg = m["content"]
+        if last_user_msg and last_assistant_msg:
             break
     
-    # Add a hint about who was last discussed
-    last_person_hint = ""
+    # Determine who was the PRIMARY subject of the last exchange
+    primary_person = None
     if last_assistant_msg:
+        # Find who is discussed substantively (not negatively)
         for name in known_names:
-            if name.lower() in last_assistant_msg.lower()[:500]:
-                last_person_hint = f"\n\nNOTE: The last assistant response primarily discussed: {name}"
-                break
+            name_lower = name.lower()
+            msg_lower = last_assistant_msg.lower()
+            
+            # Find first occurrence
+            pos = msg_lower.find(name_lower)
+            if pos == -1:
+                continue
+            
+            # Check if this is a substantive mention (not "I don't have info about X")
+            context_before = msg_lower[max(0, pos-60):pos]
+            negative_phrases = ["don't have", "no information", "not have", "don't know", "no data", "i don't", "not found"]
+            
+            if not any(phrase in context_before for phrase in negative_phrases):
+                # This person was discussed substantively
+                # Check if they appear early in the response (likely the subject)
+                if pos < 200:  # Mentioned in first 200 chars
+                    primary_person = name
+                    break
+    
+    # If we identified a primary person from last response, use simple substitution
+    if primary_person and has_reference:
+        # Simple pronoun replacement without LLM
+        rewritten = query
+        replacements = [
+            (r'\bhis\b', f"{primary_person}'s"),
+            (r'\bher\b', f"{primary_person}'s"),
+            (r'\bhim\b', primary_person),
+            (r'\bhe\b', primary_person),
+            (r'\bshe\b', primary_person),
+        ]
+        for pattern, replacement in replacements:
+            rewritten = re.sub(pattern, replacement, rewritten, flags=re.IGNORECASE)
+        
+        return rewritten, primary_person, False
+    
+    # Fall back to LLM rewriter for complex cases
+    # Only use last 2 exchanges for context (to avoid confusion from older history)
+    recent_history = []
+    exchange_count = 0
+    for m in reversed(conversation_history):
+        recent_history.insert(0, m)
+        if m["role"] == "user":
+            exchange_count += 1
+        if exchange_count >= 2:
+            break
+    
+    history_text = "\n\n".join([
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:500]}"
+        for m in recent_history
+    ])
     
     rewrite_prompt = """You are a query rewriter for a resume search system. 
-Given the conversation history and the new query, rewrite the query to be FULLY self-contained.
+Given the RECENT conversation and the new query, rewrite the query to be FULLY self-contained.
 
 CRITICAL RULES:
-1. Replace ALL pronouns (he/she/his/her/they/their/them) with actual names from conversation history
-2. Replace ALL contextual references like "there", "that company", "that role", "it" with the actual entity from context
-3. When resolving pronouns like "his" or "her", look at the MOST RECENT exchange to determine who is being referenced
-4. If the query already contains a person's name, DO NOT change it to a different person
-5. If the query asks about "their", "them", "all", "everyone", or "candidates", it's asking about multiple people
-6. The rewritten query must be understandable WITHOUT any conversation history
-
-IMPORTANT: Pay attention to the LAST question and answer pair. If the last answer primarily discussed a specific person, pronouns in the new query likely refer to THAT person, not someone mentioned earlier in the conversation.
+1. Replace ALL pronouns (he/she/his/her/they/their/them) with actual names
+2. Replace contextual references like "there", "that company" with actual entities
+3. Look at the LAST assistant response to determine who pronouns refer to
+4. The rewritten query must be understandable without any conversation history
 
 Known candidates: {known_names}
 
-Return JSON with exactly these fields:
-{{
-  "rewritten_query": "the fully self-contained rewritten query",
-  "person_name": "full name if query is about a SINGLE specific person, otherwise null",
-  "is_multi_person": true/false (true if query asks about multiple people)
-}}
+Return JSON: {{"rewritten_query": "...", "person_name": "name or null", "is_multi_person": true/false}}
 
-Examples:
-- "what did he do there" after discussing John at Google → "what did John do at Google"
-- "tell me more about his skills" after discussing Jane → "tell me more about Jane's skills"
-- "what are his skills" after answer mentioning Bob has Salesforce experience → "what are Bob's skills"
-- "what is their experience" → is_multi_person: true
-
-Conversation history (MOST RECENT AT THE BOTTOM):
+Recent conversation:
 {history}
 
 New query: {query}
 
-JSON response:"""
+JSON:"""
 
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
             {"role": "user", "content": rewrite_prompt.format(
-                history=history_text + last_person_hint, 
+                history=history_text, 
                 query=query,
                 known_names=", ".join(known_names)
             )}
@@ -672,8 +727,10 @@ def detect_person_in_query(query: str, known_names: list[str]) -> tuple[Optional
     query_lower = query.lower()
     
     # Check for multi-person indicators
-    multi_person_keywords = ['their', 'them', 'all', 'everyone', 'candidates', 'compare', 'both', 'each']
-    is_multi = any(f' {kw} ' in f' {query_lower} ' or query_lower.startswith(f'{kw} ') for kw in multi_person_keywords)
+    multi_person_keywords = ['their', 'them', 'all', 'everyone', 'candidates', 'compare', 
+                             'both', 'each', 'every', 'all of', 'everybody', 'anyone',
+                             'who has', 'who have', 'which candidate', 'any of']
+    is_multi = any(kw in query_lower for kw in multi_person_keywords)
     
     # Count how many people are mentioned
     mentioned_people = []
@@ -718,7 +775,9 @@ def retrieve_with_filters(
     k: int = 8,
     person_filter: Optional[str] = None,
     skill_filter: Optional[str] = None,
-    min_experience: Optional[int] = None
+    min_experience: Optional[int] = None,
+    ensure_all_candidates: bool = False,
+    known_names: Optional[list[str]] = None
 ) -> list[dict]:
     
     query_embedding = get_openai_embedding([query], openai_client)[0]
@@ -736,10 +795,58 @@ def retrieve_with_filters(
     elif len(where_clauses) > 1:
         where = {"$and": where_clauses}
     
-    # Retrieve more results initially to allow for post-filtering
+    # If we need to ensure all candidates are represented, query more and distribute
+    if ensure_all_candidates and known_names and not person_filter:
+        all_hits = []
+        hits_per_person = {}
+        
+        # Query each person separately to ensure coverage
+        for name in known_names:
+            person_where = {"person_name": {"$eq": name}}
+            
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=3,  # Get top 3 per person
+                where=person_where,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            if results["documents"] and results["documents"][0]:
+                for doc, meta, dist in zip(
+                    results["documents"][0],
+                    results["metadatas"][0],
+                    results["distances"][0]
+                ):
+                    if skill_filter:
+                        if skill_filter.lower() not in meta.get("skills", "").lower():
+                            continue
+                    
+                    hit = {
+                        "text": doc,
+                        "person_name": meta.get("person_name"),
+                        "chunk_type": meta.get("chunk_type"),
+                        "source_file": meta.get("source_file"),
+                        "skills": meta.get("skills"),
+                        "distance": dist
+                    }
+                    
+                    if name not in hits_per_person:
+                        hits_per_person[name] = []
+                    hits_per_person[name].append(hit)
+        
+        # Collect hits, ensuring at least 1-2 from each person
+        for name in known_names:
+            if name in hits_per_person:
+                all_hits.extend(hits_per_person[name][:2])  # Top 2 per person
+        
+        # Sort by relevance (distance) and return
+        all_hits.sort(key=lambda x: x["distance"])
+        return all_hits[:k * 2]  # Allow more results for multi-person queries
+    
+    # Standard retrieval
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=min(k * 2, 20),  # Get more to filter from
+        n_results=min(k * 2, 20),
         where=where,
         include=["documents", "metadatas", "distances"]
     )
@@ -751,7 +858,6 @@ def retrieve_with_filters(
             results["metadatas"][0],
             results["distances"][0]
         ):
-            # Post-filter by skill if specified
             if skill_filter:
                 if skill_filter.lower() not in meta.get("skills", "").lower():
                     continue
@@ -971,10 +1077,7 @@ if build_btn:
                 chunks = semantic_chunk_resume(text, metadata)
                 all_chunks.extend(chunks)
                 
-                # DEBUG: Show chunk details
                 status.write(f"✅ {pdf_file.name}: {metadata.person_name} ({len(chunks)} chunks)")
-                for j, chunk in enumerate(chunks[:3]):  # Show first 3 chunks
-                    status.write(f"   Chunk {j+1} [{chunk.chunk_type}]: {len(chunk.text)} chars - '{chunk.text[:80]}...'")
                 
             except Exception as e:
                 status.write(f"❌ Error processing {pdf_file.name}: {str(e)}")
@@ -1057,11 +1160,13 @@ if query := st.chat_input("Ask about the candidates..."):
                     k=8,
                     person_filter=p_filter,
                     skill_filter=s_filter,
-                    min_experience=m_exp
+                    min_experience=m_exp,
+                    ensure_all_candidates=is_multi_person or p_filter is None,
+                    known_names=known_names
                 )
                 
                 # DEBUG: Show what was retrieved
-                st.caption(f"🔍 Retrieved {len(hits)} chunks")
+                st.caption(f"🔍 Retrieved {len(hits)} chunks from {len(set(h['person_name'] for h in hits))} candidates")
                 if not hits:
                     st.warning("No chunks retrieved! Check if collection has data.")
                     # Try to debug collection
@@ -1084,9 +1189,20 @@ if query := st.chat_input("Ask about the candidates..."):
                 # Show sources in expander
                 if hits:
                     with st.expander("📚 Sources"):
+                        seen = set()
                         for h in hits:
+                            # Deduplicate by person + chunk_type
+                            key = f"{h['person_name']}_{h['chunk_type']}"
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            
                             st.markdown(f"**{h['person_name']}** ({h['chunk_type']})")
-                            st.caption(h['text'][:300] + "..." if len(h['text']) > 300 else h['text'])
+                            # Clean up the text preview
+                            preview = h['text'][:300].replace('\n', ' ').strip()
+                            if len(h['text']) > 300:
+                                preview += "..."
+                            st.caption(preview)
                             st.divider()
                 
                 st.session_state.messages.append({"role": "assistant", "content": answer})
