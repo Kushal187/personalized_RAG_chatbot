@@ -225,10 +225,10 @@ Document text (first 3000 chars):
             return GuardrailResult(
                 passed=False,
                 reason=f"Document appears to be '{content_type}': {reason}",
-                severity="warning"
+                severity="error"  # CHANGED FROM "warning" TO "error"
             )
         
-        # Low confidence warning
+        # Low confidence warning (still allow, but warn)
         if result.get("confidence") == "low":
             return GuardrailResult(
                 passed=True,
@@ -629,14 +629,20 @@ Do not invent or hallucinate information not present in the resume."""
     
     try:
         data = json.loads(resp.choices[0].message.content)
+        
+        # Handle None or empty person_name
+        person_name = data.get("person_name")
+        if person_name is None or person_name == "null" or str(person_name).strip() == "":
+            person_name = "Unknown"
+        
         return ResumeMetadata(
-            person_name=data.get("person_name", "Unknown"),
-            skills=data.get("skills", []),
+            person_name=person_name,
+            skills=data.get("skills") or [],
             experience_years=data.get("experience_years"),
             current_role=data.get("current_role"),
-            companies=data.get("companies", []),
-            education=data.get("education", []),
-            summary=data.get("summary", ""),
+            companies=data.get("companies") or [],
+            education=data.get("education") or [],
+            summary=data.get("summary") or "",
             source_file=filename
         )
     except json.JSONDecodeError:
@@ -1075,26 +1081,42 @@ def build_collection(chunks: list[ChunkMetadata], chroma_client, openai_client: 
         metadata={"hnsw:space": "cosine"}
     )
     
+    # Filter out chunks with invalid metadata
+    valid_chunks = []
+    for c in chunks:
+        # Skip chunks with None person_name
+        if c.person_name is None or c.person_name == "None" or c.person_name.strip() == "":
+            continue
+        valid_chunks.append(c)
+    
+    if not valid_chunks:
+        return collection
+    
     # Batch embed and add
     batch_size = 50
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
+    for i in range(0, len(valid_chunks), batch_size):
+        batch = valid_chunks[i:i + batch_size]
         texts = [c.text for c in batch]
         embeddings = get_openai_embedding(texts, openai_client)
+        
+        # Ensure no None values in metadata
+        metadatas = []
+        for c in batch:
+            metadatas.append({
+                "person_name": c.person_name or "Unknown",
+                "source_file": c.source_file or "Unknown",
+                "chunk_id": c.chunk_id or 0,
+                "chunk_type": c.chunk_type or "other",
+                "skills": c.skills or "",
+                "companies": c.companies or "",
+                "experience_years": c.experience_years if c.experience_years is not None else 0
+            })
         
         collection.add(
             ids=[f"{c.person_name}_{c.chunk_id}" for c in batch],
             embeddings=embeddings,
             documents=texts,
-            metadatas=[{
-                "person_name": c.person_name,
-                "source_file": c.source_file,
-                "chunk_id": c.chunk_id,
-                "chunk_type": c.chunk_type,
-                "skills": c.skills,
-                "companies": c.companies,
-                "experience_years": c.experience_years
-            } for c in batch]
+            metadatas=metadatas
         )
     
     return collection
@@ -1699,6 +1721,12 @@ if build_btn:
                 
                 # Extract metadata using LLM
                 metadata = extract_resume_metadata(text, pdf_file.name, client)
+                if metadata.person_name == "Unknown" or metadata.person_name is None:
+                    status.write(f"⚠️ {pdf_file.name}: Could not extract person name - skipping")
+                    rejected_count += 1
+                    rejected_files.append((pdf_file.name, "Could not identify person name in document"))
+                    progress.progress((i + 1) / len(uploaded_files))
+                    continue
                 st.session_state.resume_metadata[metadata.person_name] = metadata
                 
                 # DEBUG: Show extracted metadata
