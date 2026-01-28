@@ -25,6 +25,7 @@ load_dotenv()
 # Config
 EMBED_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
+ANSWER_MODEL = "gpt-4o"
 EXTRACTION_MODEL = "gpt-4o-mini"
 COLLECTION_NAME = "resumes"
 MAX_CONTEXT_TURNS = 5
@@ -515,6 +516,66 @@ def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMeta
     
     return chunks
 
+def expand_temporal_query(query: str, client: OpenAI) -> tuple[str, bool]:
+    """
+    Expand temporal queries to improve retrieval of date-range content.
+    Returns: (expanded_query, was_temporal)
+    """
+    
+    # Quick check if query has temporal indicators
+    temporal_patterns = [
+        r'\b(in|during|around|at|by|before|after)\s+\w+\s+\d{4}',  # "in December 2024"
+        r'\bwhat\s+was\s+\w+\s+doing',  # "what was X doing"
+        r'\bwhere\s+did\s+\w+\s+work',  # "where did X work"
+        r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d{4}',  # month year
+        r'\b(early|late|mid)\s+\d{4}',  # "early 2024"
+        r'\b(q[1-4]|first|second|third|fourth)\s+(quarter|half)?\s*\d{4}',  # "Q1 2024"
+    ]
+    
+    has_temporal = any(re.search(p, query, re.IGNORECASE) for p in temporal_patterns)
+    
+    if not has_temporal:
+        return query, False
+    
+    # Use LLM to expand the query
+    expansion_prompt = """You help improve search queries for a resume database. When someone asks about a specific time period, the resume chunks contain DATE RANGES (like "Sep 2024 - Dec 2025"), not individual months.
+
+Your job: Rewrite the query to better match resume content with date ranges that INCLUDE the queried time.
+
+RULES:
+1. Keep the original intent and person name
+2. Add terms that would match date ranges containing the queried period
+3. Include the year and surrounding months/years
+4. Keep it concise - just expand the search terms, don't write a paragraph
+
+Examples:
+- "What was John doing in December 2024?" → "John roles positions jobs December 2024 late 2024 2024-2025 experience work"
+- "Where did Sarah work in 2023?" → "Sarah work company employer job position 2023 2022-2023 2023-2024"
+- "What was Mike's role in early 2024?" → "Mike role position title job January February March April 2024 Q1 2024 late 2023 early 2024"
+- "What did Alice do in summer 2023?" → "Alice June July August 2023 summer 2023 mid 2023 work role position"
+
+Input: "{query}"
+Output (expanded search terms only):"""
+
+    try:
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": expansion_prompt.format(query=query)}],
+            temperature=0,
+            max_tokens=100
+        )
+        
+        expanded_terms = resp.choices[0].message.content.strip()
+        
+        # Combine original query with expanded terms
+        combined = f"{query} {expanded_terms}"
+        return combined, True
+        
+    except Exception as e:
+        # If expansion fails, return original
+        return query, False
+
+
 
 # ChromaDB setup with OpenAI embeddings
 def get_chroma_client():
@@ -878,6 +939,8 @@ def retrieve_with_filters(
 
 
 # Answer generation with anti-hallucination measures
+# Replace your existing generate_answer function with this one
+
 def generate_answer(
     query: str,
     hits: list[dict],
@@ -911,30 +974,81 @@ def generate_answer(
 STRICT RULES:
 1. ONLY use information explicitly stated in the provided context
 2. If information is not in the context, say "I don't have that information in the resumes"
-3. Always attribute information to the specific person (e.g., "John Smith has experience in...")
+3. Always attribute information to the specific person (e.g., "John Smith was working as...")
 4. Do not infer or assume information not explicitly stated
 5. If asked to compare candidates, only compare based on information present for all of them
 6. Use the conversation history to maintain context but don't contradict the resume data
 7. If the context is insufficient to fully answer, explain what you can answer and what's missing
-8. Always complete your response - never leave sentences unfinished"""
+8. Always complete your response - never leave sentences unfinished
+
+TEMPORAL/DATE REASONING - FOLLOW THIS EXACT PROCESS:
+
+When the user asks about a specific date/month/time period, you MUST:
+
+STEP 1: Extract the queried date
+- Convert to numeric: e.g., "July 2023" = Month 7, Year 2023
+- For seasons: "summer 2023" = June-August 2023, "early 2024" = Jan-April 2024
+
+STEP 2: For EACH date range in the context, check if queried date falls within it
+- Parse start date: e.g., "Aug 2023" = Month 8, Year 2023
+- Parse end date: e.g., "May 2024" = Month 5, Year 2024 (or current date if "Present")
+- Compare: queried_date >= start_date AND queried_date <= end_date
+
+STEP 3: Determine the answer
+- If queried date is BEFORE the start date → NOT within range, don't mention this role
+- If queried date is AFTER the end date → NOT within range, don't mention this role  
+- If queried date is WITHIN the range → This role IS relevant
+
+MONTH NUMBERS: Jan=1, Feb=2, Mar=3, Apr=4, May=5, Jun=6, Jul=7, Aug=8, Sep=9, Oct=10, Nov=11, Dec=12
+
+EXAMPLES OF CORRECT REASONING:
+
+Example 1:
+- Context: "Software Engineer at Google, Sep 2024 - Dec 2025"
+- Query: "What was X doing in Dec 2024?"
+- Reasoning: Dec 2024 (12/2024) >= Sep 2024 (9/2024) ✓ AND Dec 2024 (12/2024) <= Dec 2025 (12/2025) ✓
+- Answer: "X was working as a Software Engineer at Google"
+
+Example 2:
+- Context: "Intern at Meta, Aug 2023 - May 2024"
+- Query: "What was X doing in July 2023?"
+- Reasoning: July 2023 (7/2023) >= Aug 2023 (8/2023)? NO! 7 < 8, so July is BEFORE August
+- Answer: "I don't have information about July 2023. The earliest role I have is an internship at Meta starting in August 2023."
+
+Example 3:
+- Context: "Data Analyst, Jan 2022 - Present"
+- Query: "Where did X work in 2023?"
+- Reasoning: 2023 >= Jan 2022 ✓ AND 2023 <= Present (2025) ✓
+- Answer: "X was working as a Data Analyst"
+
+Example 4:
+- Context: "Intern at Startup, May 2023 - Aug 2023"
+- Query: "What was X doing in October 2023?"
+- Reasoning: Oct 2023 (10/2023) <= Aug 2023 (8/2023)? NO! 10 > 8, so October is AFTER August
+- Answer: "I don't have information about October 2023. The internship at Startup ended in August 2023."
+
+CRITICAL: Do NOT say someone "was working" at a job if the queried date is OUTSIDE the job's date range. 
+If the queried date is before ANY role starts, say you don't have information for that time period."""
 
     user_message = f"""{history_text}Resume excerpts:
 {context}
 
 Question: {query}
 
-Answer based ONLY on the information above:"""
+IMPORTANT: If this question asks about a specific time period, carefully compare the queried date against each date range in the context using numeric month/year comparison. Only mention roles where the queried date falls WITHIN the start and end dates.
+
+Answer:"""
 
     # Use more tokens for multi-person queries that need comprehensive answers
     max_tokens = 2000 if is_multi_person else 1000
-
+    
     resp = client.chat.completions.create(
-        model=CHAT_MODEL,
+        model=ANSWER_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ],
-        temperature=0.3,
+        temperature=0.1,  # Lower temperature for more precise reasoning
         max_tokens=max_tokens
     )
     
@@ -1153,52 +1267,58 @@ if query := st.chat_input("Ask about the candidates..."):
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             else:
                 with st.spinner("Searching..."):
-                # Get known names first
+                    # Get known names first
                     known_names = list(st.session_state.resume_metadata.keys())
-                
-                # Rewrite query with context
-                rewritten_query, detected_person, is_multi_person = rewrite_query(
-                    query,
-                    st.session_state.messages[:-1],  # Exclude current query
-                    known_names,
-                    client
-                )
-                
-                # Show rewritten query if different
-                if rewritten_query.lower() != query.lower():
-                    st.caption(f"🔄 Searching for: {rewritten_query}")
-                
-                if is_multi_person:
-                    # Multi-person query - don't filter
-                    p_filter = None
-                    st.caption(f"👥 Searching across all {len(known_names)} candidates")
-                elif detected_person and detected_person in known_names:
-                    # Single person detected
-                    p_filter = detected_person
-                    st.caption(f"👤 Filtering for: {detected_person}")
-                elif person_filter != "All":
-                    p_filter = person_filter
-                else:
-                    p_filter = None
-                
-                s_filter = skill_filter if skill_filter else None
-                m_exp = min_exp if min_exp > 0 else None
-                
-                # Retrieve
-                hits = retrieve_with_filters(
-                    rewritten_query,
-                    st.session_state.collection,
-                    client,
-                    k=8,
-                    person_filter=p_filter,
-                    skill_filter=s_filter,
-                    min_experience=m_exp,
-                    ensure_all_candidates=is_multi_person or p_filter is None,
-                    known_names=known_names
-                )
-                
-                # DEBUG: Show what was retrieved
-                st.caption(f"🔍 Retrieved {len(hits)} chunks from {len(set(h['person_name'] for h in hits))} candidates")
+                    
+                    # Rewrite query with context
+                    rewritten_query, detected_person, is_multi_person = rewrite_query(
+                        query,
+                        st.session_state.messages[:-1],  # Exclude current query
+                        known_names,
+                        client
+                    )
+                    
+                    # Show rewritten query if different
+                    if rewritten_query.lower() != query.lower():
+                        st.caption(f"🔄 Searching for: {rewritten_query}")
+                    
+                    # === NEW: Expand temporal queries for better retrieval ===
+                    search_query, is_temporal = expand_temporal_query(rewritten_query, client)
+                    if is_temporal:
+                        st.caption(f"🕐 Temporal query detected - expanding search")
+                    # =========================================================
+                    
+                    if is_multi_person:
+                        # Multi-person query - don't filter
+                        p_filter = None
+                        st.caption(f"👥 Searching across all {len(known_names)} candidates")
+                    elif detected_person and detected_person in known_names:
+                        # Single person detected
+                        p_filter = detected_person
+                        st.caption(f"👤 Filtering for: {detected_person}")
+                    elif person_filter != "All":
+                        p_filter = person_filter
+                    else:
+                        p_filter = None
+                    
+                    s_filter = skill_filter if skill_filter else None
+                    m_exp = min_exp if min_exp > 0 else None
+                    
+                    # Retrieve using expanded query for temporal searches
+                    hits = retrieve_with_filters(
+                        search_query,  # Use expanded query instead of rewritten_query
+                        st.session_state.collection,
+                        client,
+                        k=10 if is_temporal else 8,  # Get more results for temporal queries
+                        person_filter=p_filter,
+                        skill_filter=s_filter,
+                        min_experience=m_exp,
+                        ensure_all_candidates=is_multi_person or p_filter is None,
+                        known_names=known_names
+                    )
+                    
+                    # DEBUG: Show what was retrieved
+                    st.caption(f"🔍 Retrieved {len(hits)} chunks from {len(set(h['person_name'] for h in hits))} candidates")
                 if not hits:
                     st.warning("No chunks retrieved! Check if collection has data.")
                     # Try to debug collection

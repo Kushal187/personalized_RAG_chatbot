@@ -1,7 +1,10 @@
 streamlit
-openai
+openai>=1.0.0
 PyPDF2
 faiss-cpu
 numpy
 python-dotenv
+chromadb
+pdfplumber
+
 
