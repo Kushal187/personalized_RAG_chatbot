@@ -882,7 +882,8 @@ def generate_answer(
     query: str,
     hits: list[dict],
     conversation_history: list[dict],
-    client: OpenAI
+    client: OpenAI,
+    is_multi_person: bool = False
 ) -> str:
     
     if not hits:
@@ -914,7 +915,8 @@ STRICT RULES:
 4. Do not infer or assume information not explicitly stated
 5. If asked to compare candidates, only compare based on information present for all of them
 6. Use the conversation history to maintain context but don't contradict the resume data
-7. If the context is insufficient to fully answer, explain what you can answer and what's missing"""
+7. If the context is insufficient to fully answer, explain what you can answer and what's missing
+8. Always complete your response - never leave sentences unfinished"""
 
     user_message = f"""{history_text}Resume excerpts:
 {context}
@@ -923,6 +925,9 @@ Question: {query}
 
 Answer based ONLY on the information above:"""
 
+    # Use more tokens for multi-person queries that need comprehensive answers
+    max_tokens = 2000 if is_multi_person else 1000
+
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[
@@ -930,7 +935,7 @@ Answer based ONLY on the information above:"""
             {"role": "user", "content": user_message}
         ],
         temperature=0.3,
-        max_tokens=800
+        max_tokens=max_tokens
     )
     
     return resp.choices[0].message.content
@@ -1120,9 +1125,36 @@ if query := st.chat_input("Ask about the candidates..."):
             st.error("Please upload resumes and build the vector store first.")
     else:
         with st.chat_message("assistant"):
-            with st.spinner("Searching..."):
+            # Check for meta-questions about the system (don't need RAG)
+            query_lower = query.lower()
+            meta_patterns = [
+                "whose resumes", "which resumes", "what resumes", 
+                "how many resumes", "how many candidates", "list all",
+                "who do you have", "whose resume do you have",
+                "what candidates", "which candidates", "list candidates",
+                "list the candidates", "list the resumes", "show all candidates"
+            ]
+            
+            is_meta_question = any(pattern in query_lower for pattern in meta_patterns)
+            
+            if is_meta_question:
+                # Answer directly from metadata without RAG
+                names = list(st.session_state.resume_metadata.keys())
+                answer = f"I have resumes for {len(names)} candidates:\n\n"
+                for i, name in enumerate(names, 1):
+                    meta = st.session_state.resume_metadata[name]
+                    role = meta.current_role or "N/A"
+                    answer += f"{i}. **{name}**"
+                    if role != "N/A":
+                        answer += f" - {role}"
+                    answer += "\n"
+                
+                st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+            else:
+                with st.spinner("Searching..."):
                 # Get known names first
-                known_names = list(st.session_state.resume_metadata.keys())
+                    known_names = list(st.session_state.resume_metadata.keys())
                 
                 # Rewrite query with context
                 rewritten_query, detected_person, is_multi_person = rewrite_query(
@@ -1181,7 +1213,8 @@ if query := st.chat_input("Ask about the candidates..."):
                     query,
                     hits,
                     st.session_state.messages[:-1],
-                    client
+                    client,
+                    is_multi_person=is_multi_person or p_filter is None
                 )
                 
                 st.markdown(answer)
@@ -1204,6 +1237,7 @@ if query := st.chat_input("Ask about the candidates..."):
                                 preview += "..."
                             st.caption(preview)
                             st.divider()
+                
                 
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
