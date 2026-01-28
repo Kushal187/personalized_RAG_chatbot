@@ -11,6 +11,465 @@ import chromadb
 from chromadb.config import Settings
 from dotenv import load_dotenv
 
+"""
+Guardrails Module for Multi-Resume RAG Chatbot
+Add this code BEFORE your main application code, after the imports.
+"""
+
+import re
+from dataclasses import dataclass
+from typing import Optional
+from openai import OpenAI
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MAX_FILE_SIZE_MB = 2
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+GUARDRAIL_MODEL = "gpt-4o-mini"  # Cheap model for guardrails
+
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
+
+@dataclass
+class GuardrailResult:
+    passed: bool
+    reason: Optional[str] = None
+    severity: str = "info"  # "info", "warning", "error"
+
+
+# ============================================================
+# FILE-LEVEL GUARDRAILS
+# ============================================================
+
+def check_file_size(file) -> GuardrailResult:
+    """Check if file is within size limits."""
+    file.seek(0, 2)  # Seek to end
+    size = file.tell()
+    file.seek(0)  # Reset to beginning
+    
+    if size > MAX_FILE_SIZE_BYTES:
+        size_mb = size / (1024 * 1024)
+        return GuardrailResult(
+            passed=False,
+            reason=f"File size ({size_mb:.1f}MB) exceeds maximum allowed ({MAX_FILE_SIZE_MB}MB)",
+            severity="error"
+        )
+    return GuardrailResult(passed=True)
+
+
+def check_file_type(file) -> GuardrailResult:
+    """Verify file is actually a PDF by checking magic bytes."""
+    file.seek(0)
+    header = file.read(8)
+    file.seek(0)
+    
+    # PDF magic bytes: %PDF
+    if not header.startswith(b'%PDF'):
+        return GuardrailResult(
+            passed=False,
+            reason="File does not appear to be a valid PDF (invalid header)",
+            severity="error"
+        )
+    return GuardrailResult(passed=True)
+
+
+# ============================================================
+# CONTENT-LEVEL GUARDRAILS
+# ============================================================
+
+def detect_prompt_injection(text: str) -> GuardrailResult:
+    """Detect potential prompt injection attempts in document text."""
+    
+    # Patterns that indicate prompt injection attempts
+    injection_patterns = [
+        # Direct instruction overrides
+        r'ignore\s+(all\s+)?(previous|prior|above|your)\s+(instructions?|prompts?|rules?)',
+        r'disregard\s+(all\s+)?(previous|prior|above|your)\s+(instructions?|prompts?|rules?)',
+        r'forget\s+(all\s+)?(previous|prior|above|your)\s+(instructions?|prompts?|rules?)',
+        r'override\s+(all\s+)?(previous|prior|above|your)\s+(instructions?|prompts?|rules?)',
+        
+        # Role-play injections
+        r'you\s+are\s+now\s+(a|an|the)',
+        r'act\s+as\s+(a|an|if)',
+        r'pretend\s+(to\s+be|you\s+are)',
+        r'roleplay\s+as',
+        r'from\s+now\s+on\s+you',
+        
+        # System prompt extraction
+        r'(show|reveal|display|print|output)\s+(me\s+)?(your|the)\s+(system\s+)?prompt',
+        r'what\s+(are|is)\s+your\s+(system\s+)?(instructions?|prompts?|rules?)',
+        r'repeat\s+(your|the)\s+(system\s+)?(instructions?|prompts?)',
+        
+        # Jailbreak attempts
+        r'(DAN|STAN|DUDE)\s*mode',
+        r'developer\s+mode',
+        r'jailbreak',
+        r'bypass\s+(your\s+)?(restrictions?|filters?|rules?)',
+        
+        # Command injection
+        r'\[INST\]|\[\/INST\]',
+        r'<\|im_start\|>|<\|im_end\|>',
+        r'###\s*(Human|Assistant|System):',
+        r'<\|system\|>|<\|user\|>|<\|assistant\|>',
+        
+        # Hidden instructions (often in white text)
+        r'hidden\s+instructions?',
+        r'secret\s+instructions?',
+        r'do\s+not\s+tell\s+(the\s+)?user',
+        r'when\s+(answering|responding)',
+        
+        # Behavioral override attempts
+        r'no\s+matter\s+what\s+(question|query|prompt)',
+        r'always\s+(say|respond|answer|reply)\s+that',
+        r'for\s+(any|every|all)\s+(question|query|prompt)',
+        r'regardless\s+of\s+(the\s+)?(question|query|input)',
+        r'whatever\s+(the\s+)?(user|question|query)\s+(asks?|says?)',
+    ]
+    
+    text_lower = text.lower()
+    
+    for pattern in injection_patterns:
+        if re.search(pattern, text_lower):
+            return GuardrailResult(
+                passed=False,
+                reason=f"Potential prompt injection detected in document",
+                severity="error"
+            )
+    
+    return GuardrailResult(passed=True)
+
+
+def detect_suspicious_formatting(text: str) -> GuardrailResult:
+    """Detect suspicious formatting that might indicate hidden content."""
+    
+    issues = []
+    
+    # Check for excessive whitespace (might hide text)
+    whitespace_ratio = text.count(' ') / max(len(text), 1)
+    if whitespace_ratio > 0.5:
+        issues.append("Excessive whitespace detected")
+    
+    # Check for unusual Unicode characters (often used to hide text)
+    suspicious_unicode = [
+        '\u200b',  # Zero-width space
+        '\u200c',  # Zero-width non-joiner
+        '\u200d',  # Zero-width joiner
+        '\u2060',  # Word joiner
+        '\ufeff',  # Zero-width no-break space
+        '\u00a0',  # Non-breaking space (excessive use)
+    ]
+    
+    unicode_count = sum(text.count(char) for char in suspicious_unicode)
+    if unicode_count > 10:
+        issues.append(f"Suspicious Unicode characters detected ({unicode_count} instances)")
+    
+    # Check for very long lines without breaks (might be obfuscated)
+    lines = text.split('\n')
+    for line in lines:
+        if len(line) > 5000:
+            issues.append("Unusually long text lines detected")
+            break
+    
+    if issues:
+        return GuardrailResult(
+            passed=False,
+            reason="; ".join(issues),
+            severity="warning"
+        )
+    
+    return GuardrailResult(passed=True)
+
+
+def validate_resume_content(text: str, client: OpenAI) -> GuardrailResult:
+    """Use LLM to verify the document appears to be a legitimate resume."""
+    
+    validation_prompt = """Analyze this document text and determine if it appears to be a legitimate resume/CV.
+
+A legitimate resume typically contains:
+- A person's name
+- Contact information (email, phone, location)
+- Work experience or education
+- Skills or qualifications
+
+Respond with JSON:
+{
+    "is_resume": true/false,
+    "confidence": "high"/"medium"/"low",
+    "reason": "brief explanation",
+    "detected_content_type": "resume"/"job_posting"/"article"/"spam"/"other"
+}
+
+Document text (first 3000 chars):
+"""
+    
+    try:
+        resp = client.chat.completions.create(
+            model=GUARDRAIL_MODEL,
+            messages=[
+                {"role": "user", "content": validation_prompt + text[:3000]}
+            ],
+            temperature=0,
+            max_tokens=150,
+            response_format={"type": "json_object"}
+        )
+        
+        import json
+        result = json.loads(resp.choices[0].message.content)
+        
+        if not result.get("is_resume", False):
+            content_type = result.get("detected_content_type", "unknown")
+            reason = result.get("reason", "Document does not appear to be a resume")
+            return GuardrailResult(
+                passed=False,
+                reason=f"Document appears to be '{content_type}': {reason}",
+                severity="warning"
+            )
+        
+        # Low confidence warning
+        if result.get("confidence") == "low":
+            return GuardrailResult(
+                passed=True,
+                reason="Document may not be a standard resume format",
+                severity="warning"
+            )
+        
+        return GuardrailResult(passed=True)
+        
+    except Exception as e:
+        # If validation fails, allow but warn
+        return GuardrailResult(
+            passed=True,
+            reason=f"Could not validate document type: {str(e)}",
+            severity="warning"
+        )
+
+
+# ============================================================
+# QUERY-LEVEL GUARDRAILS
+# ============================================================
+
+def check_query_injection(query: str) -> GuardrailResult:
+    """Check if user query contains prompt injection attempts."""
+    
+    injection_patterns = [
+        r'ignore\s+(all\s+)?(previous|prior|above|your)\s+(instructions?|prompts?|rules?)',
+        r'system\s*prompt',
+        r'you\s+are\s+now',
+        r'act\s+as\s+if',
+        r'pretend\s+(to\s+be|you)',
+        r'\[INST\]',
+        r'<\|',
+        r'###\s*(Human|System|Assistant)',
+    ]
+    
+    query_lower = query.lower()
+    
+    for pattern in injection_patterns:
+        if re.search(pattern, query_lower):
+            return GuardrailResult(
+                passed=False,
+                reason="Query contains suspicious patterns",
+                severity="warning"
+            )
+    
+    return GuardrailResult(passed=True)
+
+
+def check_query_relevance(query: str, client: OpenAI) -> GuardrailResult:
+    """Check if query is relevant to resume/candidate information."""
+    
+    # Quick keyword check first (avoid LLM call for obvious cases)
+    resume_keywords = [
+        'experience', 'skill', 'education', 'work', 'job', 'role', 'company',
+        'project', 'resume', 'candidate', 'qualification', 'degree', 'university',
+        'intern', 'position', 'team', 'manage', 'develop', 'build', 'create',
+        'year', 'month', 'doing', 'did', 'where', 'what', 'who', 'which',
+        'compare', 'list', 'show', 'tell', 'summary', 'background', 'history'
+    ]
+    
+    query_lower = query.lower()
+    if any(kw in query_lower for kw in resume_keywords):
+        return GuardrailResult(passed=True)
+    
+    # For ambiguous queries, use LLM
+    relevance_prompt = """Is this query asking about resume/CV information, job candidates, or professional backgrounds?
+
+Valid queries include:
+- Questions about work experience, skills, education
+- Questions about specific candidates
+- Comparisons between candidates
+- Questions about projects, roles, companies
+- Meta questions about loaded resumes
+
+Invalid queries include:
+- General knowledge questions unrelated to resumes
+- Requests to write code, stories, or other content
+- Questions about current events, news, etc.
+- Personal advice unrelated to job candidates
+
+Query: "{query}"
+
+Respond with JSON: {{"is_relevant": true/false, "reason": "brief explanation"}}"""
+
+    try:
+        resp = client.chat.completions.create(
+            model=GUARDRAIL_MODEL,
+            messages=[{"role": "user", "content": relevance_prompt.format(query=query)}],
+            temperature=0,
+            max_tokens=100,
+            response_format={"type": "json_object"}
+        )
+        
+        import json
+        result = json.loads(resp.choices[0].message.content)
+        
+        if not result.get("is_relevant", True):
+            return GuardrailResult(
+                passed=False,
+                reason=result.get("reason", "Query does not appear to be about resume information"),
+                severity="info"
+            )
+        
+        return GuardrailResult(passed=True)
+        
+    except Exception:
+        # If check fails, allow the query
+        return GuardrailResult(passed=True)
+
+
+# ============================================================
+# RESPONSE-LEVEL GUARDRAILS
+# ============================================================
+
+def check_response_safety(response: str) -> GuardrailResult:
+    """Check if the generated response is safe and appropriate."""
+    
+    # Check for potential data leakage patterns
+    sensitive_patterns = [
+        r'\b\d{3}-\d{2}-\d{4}\b',  # SSN format
+        r'\b\d{16}\b',  # Credit card number
+        r'password\s*[:=]\s*\S+',  # Password exposure
+    ]
+    
+    for pattern in sensitive_patterns:
+        if re.search(pattern, response, re.IGNORECASE):
+            return GuardrailResult(
+                passed=False,
+                reason="Response may contain sensitive information",
+                severity="error"
+            )
+    
+    return GuardrailResult(passed=True)
+
+
+# ============================================================
+# MAIN GUARDRAIL FUNCTIONS (USE THESE IN YOUR APP)
+# ============================================================
+
+def run_file_guardrails(file, client: OpenAI) -> tuple[bool, list[str], list[str]]:
+    """
+    Run all file-level guardrails.
+    Returns: (passed, errors, warnings)
+    """
+    errors = []
+    warnings = []
+    
+    # 1. File size check
+    result = check_file_size(file)
+    if not result.passed:
+        errors.append(result.reason)
+    
+    # 2. File type check
+    result = check_file_type(file)
+    if not result.passed:
+        errors.append(result.reason)
+    
+    return len(errors) == 0, errors, warnings
+
+
+def run_content_guardrails(text: str, client: OpenAI) -> tuple[bool, list[str], list[str]]:
+    """
+    Run all content-level guardrails after text extraction.
+    Returns: (passed, errors, warnings)
+    """
+    errors = []
+    warnings = []
+    
+    # 1. Prompt injection detection
+    result = detect_prompt_injection(text)
+    if not result.passed:
+        if result.severity == "error":
+            errors.append(result.reason)
+        else:
+            warnings.append(result.reason)
+    
+    # 2. Suspicious formatting detection
+    result = detect_suspicious_formatting(text)
+    if not result.passed:
+        if result.severity == "error":
+            errors.append(result.reason)
+        else:
+            warnings.append(result.reason)
+    
+    # 3. Resume content validation
+    result = validate_resume_content(text, client)
+    if not result.passed:
+        if result.severity == "error":
+            errors.append(result.reason)
+        else:
+            warnings.append(result.reason)
+    elif result.reason:  # Passed but with warning
+        warnings.append(result.reason)
+    
+    return len(errors) == 0, errors, warnings
+
+
+def run_query_guardrails(query: str, client: OpenAI) -> tuple[bool, Optional[str]]:
+    """
+    Run all query-level guardrails.
+    Returns: (passed, error_message)
+    """
+    # 1. Injection check
+    result = check_query_injection(query)
+    if not result.passed:
+        return False, "I can't process that query. Please ask a question about the candidates."
+    
+    # 2. Relevance check
+    result = check_query_relevance(query, client)
+    if not result.passed:
+        return False, "I'm designed to answer questions about job candidates and their resumes. Please ask something related to the uploaded resumes."
+    
+    return True, None
+
+
+def sanitize_text_for_llm(text: str) -> str:
+    """
+    Sanitize extracted text before sending to LLM.
+    Removes or neutralizes potential injection attempts.
+    """
+    # Remove zero-width characters
+    zero_width_chars = ['\u200b', '\u200c', '\u200d', '\u2060', '\ufeff']
+    for char in zero_width_chars:
+        text = text.replace(char, '')
+    
+    # Normalize excessive whitespace
+    text = re.sub(r'[ \t]{10,}', ' ', text)
+    
+    # Remove potential instruction markers
+    instruction_markers = [
+        r'\[INST\].*?\[/INST\]',
+        r'<\|im_start\|>.*?<\|im_end\|>',
+        r'###\s*(Human|Assistant|System):.*?(?=###|$)',
+    ]
+    
+    for pattern in instruction_markers:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+    
+    return text
+
 # Try importing PDF libraries - prefer pdfplumber for complex layouts
 try:
     import pdfplumber
@@ -446,6 +905,20 @@ def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMeta
         
         for entry in entries:
             entry = entry.strip()
+            entry_lower = entry.lower()
+            injection_phrases = [
+                'no matter what question',
+                'always say',
+                'always respond',
+                'ignore all instructions',
+                'ignore previous instructions',
+                'you are now',
+                'act as if',
+                'pretend to be',
+                'disregard your',
+            ]
+            if any(phrase in entry_lower for phrase in injection_phrases):
+                continue
             
             # Different minimum sizes for different section types
             # Education entries can be short (just school + degree + date)
@@ -1166,6 +1639,10 @@ if build_btn:
         st.error("Please upload at least one PDF resume.")
     else:
         all_chunks = []
+        processed_count = 0
+        rejected_count = 0
+        rejected_files = []
+        
         progress = st.progress(0)
         status = st.status("Processing resumes...", expanded=True)
         
@@ -1173,13 +1650,49 @@ if build_btn:
             status.write(f"Processing: {pdf_file.name}")
             
             try:
+                # === GUARDRAIL: File-level checks ===
+                passed, errors, warnings = run_file_guardrails(pdf_file, client)
+                
+                if not passed:
+                    for err in errors:
+                        status.write(f"❌ {pdf_file.name}: {err}")
+                    rejected_count += 1
+                    rejected_files.append((pdf_file.name, errors[0] if errors else "Unknown error"))
+                    progress.progress((i + 1) / len(uploaded_files))
+                    continue
+                
+                for warn in warnings:
+                    status.write(f"⚠️ {pdf_file.name}: {warn}")
+                # =====================================
+                
                 # Extract text
                 raw_text = extract_text_from_pdf(pdf_file)
                 if not raw_text.strip():
                     status.write(f"⚠️ Empty text extracted from {pdf_file.name}")
+                    rejected_count += 1
+                    rejected_files.append((pdf_file.name, "Empty text extracted"))
+                    progress.progress((i + 1) / len(uploaded_files))
                     continue
                 
                 text = normalize_text(raw_text)
+                
+                # === GUARDRAIL: Content-level checks ===
+                passed, errors, warnings = run_content_guardrails(text, client)
+                
+                if not passed:
+                    for err in errors:
+                        status.write(f"❌ {pdf_file.name}: {err}")
+                    rejected_count += 1
+                    rejected_files.append((pdf_file.name, errors[0] if errors else "Content validation failed"))
+                    progress.progress((i + 1) / len(uploaded_files))
+                    continue
+                
+                for warn in warnings:
+                    status.write(f"⚠️ {pdf_file.name}: {warn}")
+                
+                # Sanitize text before processing
+                text = sanitize_text_for_llm(text)
+                # ========================================
                 
                 # DEBUG: Show extracted text length
                 status.write(f"   📝 Extracted {len(text)} chars, {len(text.split())} words")
@@ -1197,14 +1710,18 @@ if build_btn:
                 all_chunks.extend(chunks)
                 
                 status.write(f"✅ {pdf_file.name}: {metadata.person_name} ({len(chunks)} chunks)")
+                processed_count += 1
                 
             except Exception as e:
                 status.write(f"❌ Error processing {pdf_file.name}: {str(e)}")
+                rejected_count += 1
+                rejected_files.append((pdf_file.name, str(e)))
                 import traceback
                 status.write(f"   {traceback.format_exc()}")
             
             progress.progress((i + 1) / len(uploaded_files))
         
+        # === IMPROVED: Handle results based on what was processed ===
         if all_chunks:
             status.write("Building ChromaDB collection...")
             collection = build_collection(
@@ -1218,9 +1735,26 @@ if build_btn:
             st.session_state.all_chunks = all_chunks
             
             status.update(label="✅ Vector store built!", state="complete")
-            st.success(f"Processed {len(st.session_state.resume_metadata)} resumes with {len(all_chunks)} chunks")
+            st.success(f"Processed {processed_count} resume(s) with {len(all_chunks)} chunks")
+            
+            # Show rejected files if any
+            if rejected_count > 0:
+                st.warning(f"{rejected_count} file(s) were rejected:")
+                for filename, reason in rejected_files:
+                    st.caption(f"• {filename}: {reason}")
+        
+        elif rejected_count > 0 and processed_count == 0:
+            # All files were rejected
+            status.update(label="⚠️ No files could be processed", state="complete")
+            st.error(f"All {rejected_count} file(s) were rejected due to security or validation issues:")
+            for filename, reason in rejected_files:
+                st.write(f"• **{filename}**: {reason}")
+            st.info("Please upload valid resume PDFs without any suspicious content.")
+        
         else:
-            st.error("No valid chunks created. Check your PDF files.")
+            # No files uploaded or some other issue
+            status.update(label="❌ Processing failed", state="error")
+            st.error("No valid chunks created. Please check your PDF files.")
 
 
 # Chat interface
@@ -1233,6 +1767,14 @@ if query := st.chat_input("Ask about the candidates..."):
     
     with st.chat_message("user"):
         st.markdown(query)
+    
+    if st.session_state.collection is not None:
+        query_ok, query_error = run_query_guardrails(query, client)
+        if not query_ok:
+            with st.chat_message("assistant"):
+                st.warning(query_error)
+                st.session_state.messages.append({"role": "assistant", "content": query_error})
+            st.stop()
     
     if st.session_state.collection is None:
         with st.chat_message("assistant"):
@@ -1337,6 +1879,10 @@ if query := st.chat_input("Ask about the candidates..."):
                     is_multi_person=is_multi_person or p_filter is None
                 )
                 
+                response_check = check_response_safety(answer)
+                if not response_check.passed:
+                    answer = "I encountered an issue generating a safe response. Please try rephrasing your question."
+                
                 st.markdown(answer)
                 
                 # Show sources in expander
@@ -1344,6 +1890,18 @@ if query := st.chat_input("Ask about the candidates..."):
                     with st.expander("📚 Sources"):
                         seen = set()
                         for h in hits:
+                            # Skip chunks that look like injection attempts
+                            chunk_text_lower = h['text'].lower()
+                            suspicious_phrases = [
+                                'no matter what question',
+                                'always say',
+                                'ignore all instructions',
+                                'you are now',
+                                'act as if',
+                            ]
+                            if any(phrase in chunk_text_lower for phrase in suspicious_phrases):
+                                continue  # Skip this suspicious chunk
+                            
                             # Deduplicate by person + chunk_type
                             key = f"{h['person_name']}_{h['chunk_type']}"
                             if key in seen:
@@ -1351,7 +1909,6 @@ if query := st.chat_input("Ask about the candidates..."):
                             seen.add(key)
                             
                             st.markdown(f"**{h['person_name']}** ({h['chunk_type']})")
-                            # Clean up the text preview
                             preview = h['text'][:300].replace('\n', ' ').strip()
                             if len(h['text']) > 300:
                                 preview += "..."
