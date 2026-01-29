@@ -11,10 +11,6 @@ import chromadb
 from chromadb.config import Settings
 from dotenv import load_dotenv
 
-"""
-Guardrails Module for Multi-Resume RAG Chatbot
-Add this code BEFORE your main application code, after the imports.
-"""
 
 import re
 from dataclasses import dataclass
@@ -1566,17 +1562,16 @@ if "resume_metadata" not in st.session_state:
 
 # Sidebar
 with st.sidebar:
-    st.subheader("🔑 API Key")
+    # st.subheader("🔑 API Key")
     api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        api_key = st.text_input("Enter OpenAI API Key", type="password")
+    # if not api_key:
+    #     api_key = st.text_input("Enter OpenAI API Key", type="password")
     if not api_key:
         st.error("Please provide an OpenAI API key")
         st.stop()
     
     client = OpenAI(api_key=api_key)
     
-    st.divider()
     
     st.subheader("📤 Upload Resumes")
     uploaded_files = st.file_uploader(
@@ -1594,27 +1589,7 @@ with st.sidebar:
     
     st.divider()
     
-    # Filtering options
-    st.subheader("🔍 Search Filters")
     
-    person_names = list(st.session_state.resume_metadata.keys())
-    person_filter = st.selectbox(
-        "Filter by person",
-        ["All"] + person_names,
-        key="person_filter"
-    )
-    
-    skill_filter = st.text_input("Filter by skill (contains)", key="skill_filter")
-    
-    min_exp = st.number_input(
-        "Minimum years experience",
-        min_value=0,
-        max_value=50,
-        value=0,
-        key="min_exp"
-    )
-    
-    st.divider()
     
     if st.button("🗑️ Clear Chat"):
         st.session_state.messages = []
@@ -1622,27 +1597,7 @@ with st.sidebar:
     
     st.divider()
     
-    # DEBUG: Show all chunks button
-    if st.button("🔍 Debug: Show All Chunks"):
-        if "all_chunks" in st.session_state:
-            st.write(f"Total chunks: {len(st.session_state.all_chunks)}")
-            for chunk in st.session_state.all_chunks:
-                st.write(f"**{chunk.person_name}** - {chunk.chunk_type} ({len(chunk.text)} chars)")
-                st.caption(chunk.text[:500] + "..." if len(chunk.text) > 500 else chunk.text)
-                st.divider()
-    
-    # DEBUG: Search specific text in chunks
-    debug_search = st.text_input("🔎 Debug: Search in chunks", key="debug_search")
-    if debug_search and "all_chunks" in st.session_state:
-        matches = [c for c in st.session_state.all_chunks if debug_search.lower() in c.text.lower()]
-        st.write(f"Found {len(matches)} chunks containing '{debug_search}':")
-        for chunk in matches:
-            st.write(f"**{chunk.person_name}** - {chunk.chunk_type}")
-            # Highlight the search term
-            st.caption(chunk.text[:500])
-            st.divider()
-    
-    st.divider()
+   
     
     # Show loaded resumes
     if st.session_state.resume_metadata:
@@ -1866,23 +1821,19 @@ if query := st.chat_input("Ask about the candidates..."):
                         # Single person detected
                         p_filter = detected_person
                         st.caption(f"👤 Filtering for: {detected_person}")
-                    elif person_filter != "All":
-                        p_filter = person_filter
                     else:
                         p_filter = None
                     
-                    s_filter = skill_filter if skill_filter else None
-                    m_exp = min_exp if min_exp > 0 else None
+                
                     
                     # Retrieve using expanded query for temporal searches
+                    # AFTER
                     hits = retrieve_with_filters(
-                        search_query,  # Use expanded query instead of rewritten_query
+                        search_query,
                         st.session_state.collection,
                         client,
-                        k=10 if is_temporal else 8,  # Get more results for temporal queries
+                        k=10 if is_temporal else 8,
                         person_filter=p_filter,
-                        skill_filter=s_filter,
-                        min_experience=m_exp,
                         ensure_all_candidates=is_multi_person or p_filter is None,
                         known_names=known_names
                     )
