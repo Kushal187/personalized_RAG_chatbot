@@ -39,7 +39,7 @@ A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural lang
 ## ✨ Features
 
 ### Core Functionality
-- **📄 Multi-Resume Upload** — Drag and drop up to 20 PDF resumes (max 2MB each)
+- **📄 Multi-Resume Upload** — Drag and drop PDF resumes (max 2MB each)
 - **🔍 Semantic Search** — Find candidates based on skills, experience, and qualifications using vector similarity
 - **💬 Natural Language Queries** — Ask questions like "Who has Python experience?" or "Compare candidates with ML background"
 - **🧠 Conversation Context** — Maintains context across questions with pronoun resolution ("What about his education?")
@@ -72,8 +72,9 @@ A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural lang
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/resumeai.git
-   cd resumeai
+   git clone https://github.com/yourusername/personalized_RAG_chatbot.git
+
+   cd personalized_RAG_chatbot
    ```
 
 2. **Create a virtual environment**
@@ -164,7 +165,6 @@ The application uses the following OpenAI models (configurable in `app.py`):
 **Single Candidate**
 - "Tell me about John's experience"
 - "What skills does Sarah have?"
-- "Where did Mike work before his current role?"
 
 **Temporal Queries**
 - "What was John doing in December 2024?"
@@ -177,7 +177,6 @@ The application uses the following OpenAI models (configurable in `app.py`):
 
 **Follow-up Questions**
 - "What about his education?" (resolves pronoun from context)
-- "Tell me more about that role"
 
 ---
 
