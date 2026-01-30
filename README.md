@@ -12,7 +12,7 @@ A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural lang
 
 ## 📸 Screenshots
 
-### Empty State
+### Landing Page
 ![Empty State](screenshots/empty-state.png)
 *Clean interface prompting users to upload resumes and get started*
 
