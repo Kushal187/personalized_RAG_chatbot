@@ -2,11 +2,11 @@
 
 A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural language queries over multiple candidate resumes. Upload PDF resumes and ask questions about candidates using conversational AI.
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://personalizedragchatbot-kushal.streamlit.app/)
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://resume-rag-kushal.streamlit.app/)
 
 ## 🚀 Live Demo
 
-**[Try ResumeAI →](https://personalizedragchatbot-kushal.streamlit.app/)**
+**[Try ResumeAI →](https://resume-rag-kushal.streamlit.app/)**
 
 ---
 
