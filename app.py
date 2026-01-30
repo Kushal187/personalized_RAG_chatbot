@@ -1759,9 +1759,9 @@ with st.sidebar:
         key="resume_uploader"
     )
     
-    if uploaded_files and len(uploaded_files) > 20:
-        st.warning("Max 20 files allowed. Using first 20.")
-        uploaded_files = uploaded_files[:20]
+    if uploaded_files and len(uploaded_files) > 50:
+        st.warning("Max 50 files allowed. Using first 50.")
+        uploaded_files = uploaded_files[:50]
     
     col1, col2 = st.columns(2)
     with col1:
