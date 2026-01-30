@@ -485,8 +485,178 @@ EXTRACTION_MODEL = "gpt-4o-mini"
 COLLECTION_NAME = "resumes"
 MAX_CONTEXT_TURNS = 5
 
-st.set_page_config(page_title="Multi-Resume RAG Chatbot", page_icon="📄", layout="wide")
-
+st.set_page_config(
+    page_title="ResumeAI | Smart Candidate Search",
+    page_icon="🎯",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+st.markdown("""
+<style>
+    /* Main container styling */
+    .main .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        max-width: 1200px;
+    }
+    
+    /* Header styling */
+    .main-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 2rem 2.5rem;
+        border-radius: 16px;
+        margin-bottom: 2rem;
+        box-shadow: 0 10px 40px rgba(102, 126, 234, 0.3);
+    }
+    
+    .main-header h1 {
+        color: white;
+        font-size: 2.2rem;
+        font-weight: 700;
+        margin: 0;
+    }
+    
+    .main-header p {
+        color: rgba(255,255,255,0.9);
+        font-size: 1.1rem;
+        margin: 0.5rem 0 0 0;
+    }
+    
+    /* Stats cards */
+    .stats-container {
+        display: flex;
+        gap: 1rem;
+        margin-bottom: 1.5rem;
+    }
+    
+    .stat-card {
+        background: white;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 1.25rem;
+        flex: 1;
+        text-align: center;
+        transition: all 0.2s ease;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+    }
+    
+    .stat-card:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+    }
+    
+    .stat-number {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #667eea;
+        line-height: 1;
+    }
+    
+    .stat-label {
+        font-size: 0.85rem;
+        color: #6b7280;
+        margin-top: 0.5rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    
+    /* Sidebar styling */
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #1e1b4b 0%, #312e81 100%);
+    }
+    
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] span {
+        color: white !important;
+    }
+    
+    section[data-testid="stSidebar"] .stButton > button {
+        width: 100%;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        padding: 0.75rem 1.5rem;
+        border-radius: 10px;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+    }
+    
+    section[data-testid="stSidebar"] .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5);
+    }
+    
+    /* Candidate cards in sidebar */
+    .candidate-card {
+        background: rgba(255,255,255,0.1);
+        border-radius: 10px;
+        padding: 1rem;
+        margin-bottom: 0.75rem;
+        border: 1px solid rgba(255,255,255,0.1);
+        transition: all 0.2s ease;
+    }
+    
+    .candidate-card:hover {
+        background: rgba(255,255,255,0.15);
+        border-color: rgba(255,255,255,0.2);
+    }
+    
+    .candidate-name {
+        font-weight: 600;
+        font-size: 1rem;
+        color: white;
+        margin-bottom: 0.25rem;
+    }
+    
+    .candidate-role {
+        font-size: 0.85rem;
+        color: rgba(255,255,255,0.7);
+        margin-bottom: 0.5rem;
+    }
+    
+    .candidate-skills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+    }
+    
+    .skill-tag {
+        background: rgba(102, 126, 234, 0.3);
+        color: white;
+        padding: 0.2rem 0.5rem;
+        border-radius: 20px;
+        font-size: 0.7rem;
+    }
+    
+    /* Empty state */
+    .empty-state {
+        text-align: center;
+        padding: 3rem;
+        color: #9ca3af;
+    }
+    
+    .empty-state-icon {
+        font-size: 4rem;
+        margin-bottom: 1rem;
+    }
+    
+    /* Hide default streamlit elements */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    
+    /* Sidebar divider */
+    .sidebar-divider {
+        border: none;
+        border-top: 1px solid rgba(255,255,255,0.1);
+        margin: 1.5rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # Data structures
 @dataclass
@@ -1547,8 +1717,8 @@ Answer:"""
 
 
 # Streamlit UI
-st.title("📄 Multi-Resume RAG Chatbot")
-st.markdown("Upload multiple resumes to search and query candidate information.")
+# st.title("📄 Multi-Resume RAG Chatbot")
+# st.markdown("Upload multiple resumes to search and query candidate information.")
 
 # Initialize session state
 if "messages" not in st.session_state:
@@ -1562,52 +1732,89 @@ if "resume_metadata" not in st.session_state:
 
 # Sidebar
 with st.sidebar:
-    # st.subheader("🔑 API Key")
+    # Logo/Brand section
+    st.markdown("""
+    <div style="text-align: center; padding: 1rem 0;">
+        <span style="font-size: 2.5rem;">🎯</span>
+        <h2 style="margin: 0.5rem 0; font-size: 1.4rem;">ResumeAI</h2>
+        <p style="font-size: 0.85rem; opacity: 0.8;">Smart Candidate Search</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
+    
     api_key = os.getenv("OPENAI_API_KEY")
-    # if not api_key:
-    #     api_key = st.text_input("Enter OpenAI API Key", type="password")
     if not api_key:
         st.error("Please provide an OpenAI API key")
         st.stop()
     
     client = OpenAI(api_key=api_key)
     
-    
-    st.subheader("📤 Upload Resumes")
+    st.markdown("### 📤 Upload Resumes")
     uploaded_files = st.file_uploader(
-        "Upload PDF resumes (up to 20)",
+        "Drop PDF resumes here",
         type=["pdf"],
         accept_multiple_files=True,
+        label_visibility="collapsed",
         key="resume_uploader"
     )
     
     if uploaded_files and len(uploaded_files) > 20:
-        st.warning("Maximum 20 files allowed. Only first 20 will be processed.")
+        st.warning("Max 20 files allowed. Using first 20.")
         uploaded_files = uploaded_files[:20]
     
-    build_btn = st.button("🔨 Build Vector Store", type="primary")
+    col1, col2 = st.columns(2)
+    with col1:
+        build_btn = st.button("🔨 Build", type="primary", use_container_width=True)
+    with col2:
+        if st.button("🗑️ Clear", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
     
-    st.divider()
+    st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
     
-    
-    
-    if st.button("🗑️ Clear Chat"):
-        st.session_state.messages = []
-        st.rerun()
-    
-    st.divider()
-    
-   
-    
-    # Show loaded resumes
+    # Show loaded resumes with new card design
     if st.session_state.resume_metadata:
-        st.subheader("📋 Loaded Resumes")
+        st.markdown(f"### 👥 Candidates ({len(st.session_state.resume_metadata)})")
         for name, meta in st.session_state.resume_metadata.items():
-            with st.expander(name):
-                st.write(f"**Role:** {meta.current_role or 'N/A'}")
-                st.write(f"**Experience:** {meta.experience_years or 'N/A'} years")
-                st.write(f"**Skills:** {', '.join(meta.skills[:5])}...")
-                st.write(f"**File:** {meta.source_file}")
+            skills_html = "".join([f'<span class="skill-tag">{s}</span>' for s in meta.skills[:4]])
+            st.markdown(f"""
+            <div class="candidate-card">
+                <div class="candidate-name">{name}</div>
+                <div class="candidate-role">{meta.current_role or 'Role not specified'}</div>
+                <div class="candidate-skills">{skills_html}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+# Main Header
+st.markdown("""
+<div class="main-header">
+    <h1>🎯 ResumeAI</h1>
+    <p>Upload resumes and ask questions about candidates using natural language</p>
+</div>
+""", unsafe_allow_html=True)
+
+# Stats row
+num_candidates = len(st.session_state.resume_metadata)
+num_chunks = len(st.session_state.get('all_chunks', []))
+num_messages = len(st.session_state.messages)
+
+st.markdown(f"""
+<div class="stats-container">
+    <div class="stat-card">
+        <div class="stat-number">{num_candidates}</div>
+        <div class="stat-label">Candidates</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-number">{num_chunks}</div>
+        <div class="stat-label">Indexed Chunks</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-number">{num_messages // 2}</div>
+        <div class="stat-label">Questions Asked</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 
 # Build vector store
@@ -1741,29 +1948,49 @@ if build_btn:
 
 
 # Chat interface
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+if st.session_state.messages:
+    for msg in st.session_state.messages:
+        avatar = "👤" if msg["role"] == "user" else "🤖"
+        with st.chat_message(msg["role"], avatar=avatar):
+            st.markdown(msg["content"])
+else:
+    # Empty state
+    if not st.session_state.collection:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="empty-state-icon">📄</div>
+            <h3>No resumes loaded yet</h3>
+            <p>Upload PDF resumes in the sidebar and click "Build" to get started</p>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div class="empty-state">
+            <div class="empty-state-icon">💬</div>
+            <h3>Ready to search!</h3>
+            <p>Ask questions about the candidates below</p>
+        </div>
+        """, unsafe_allow_html=True)
 
 if query := st.chat_input("Ask about the candidates..."):
     st.session_state.messages.append({"role": "user", "content": query})
     
-    with st.chat_message("user"):
+    with st.chat_message("user", avatar="👤"):
         st.markdown(query)
     
     if st.session_state.collection is not None:
         query_ok, query_error = run_query_guardrails(query, client)
         if not query_ok:
-            with st.chat_message("assistant"):
+            with st.chat_message("assistant", avatar="🤖"):
                 st.warning(query_error)
                 st.session_state.messages.append({"role": "assistant", "content": query_error})
             st.stop()
     
     if st.session_state.collection is None:
-        with st.chat_message("assistant"):
+        with st.chat_message("assistant", avatar="🤖"):
             st.error("Please upload resumes and build the vector store first.")
     else:
-        with st.chat_message("assistant"):
+        with st.chat_message("assistant", avatar="🤖"):
             # Check for meta-questions about the system (don't need RAG)
             query_lower = query.lower()
             meta_patterns = [
@@ -1897,5 +2124,4 @@ if query := st.chat_input("Ask about the candidates..."):
                 
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
-st.divider()
-st.caption("💡 Tip: Use filters in the sidebar to narrow down your search to specific candidates or skills.")
+
