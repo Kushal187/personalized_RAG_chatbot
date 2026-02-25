@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Brain, MessageSquare, Sparkles, Upload, Zap } from "lucide-react";
 import { buildIndex, clearIndex, getStatus, sendChat } from "./api";
 import type { ChatMessage, StatusResponse } from "./types";
@@ -47,6 +47,57 @@ function normalizeAssistantText(content: string): string {
       // markdown list markers using '*'
       .replace(/^\s*\*\s+/gm, "- ")
   );
+}
+
+function renderAssistantContent(content: string): ReactNode[] {
+  const normalized = normalizeAssistantText(content);
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  const chunks: ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = urlRegex.exec(normalized)) !== null) {
+    const start = match.index;
+    const rawUrl = match[0];
+
+    if (start > lastIndex) {
+      chunks.push(normalized.slice(lastIndex, start));
+    }
+
+    let cleanUrl = rawUrl;
+    let trailing = "";
+    while (/[),.!?]$/.test(cleanUrl)) {
+      trailing = cleanUrl.slice(-1) + trailing;
+      cleanUrl = cleanUrl.slice(0, -1);
+    }
+
+    if (cleanUrl.length > 0) {
+      chunks.push(
+        <a
+          key={`url-${start}`}
+          href={cleanUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          {cleanUrl}
+        </a>
+      );
+    } else {
+      chunks.push(rawUrl);
+    }
+
+    if (trailing) {
+      chunks.push(trailing);
+    }
+
+    lastIndex = start + rawUrl.length;
+  }
+
+  if (lastIndex < normalized.length) {
+    chunks.push(normalized.slice(lastIndex));
+  }
+
+  return chunks.length > 0 ? chunks : [normalized];
 }
 
 export default function App() {
@@ -355,7 +406,7 @@ export default function App() {
                 <div className={`message-bubble ${message.role === "user" ? "user" : "assistant"}`}>
                   <p>
                     {message.role === "assistant"
-                      ? normalizeAssistantText(message.content)
+                      ? renderAssistantContent(message.content)
                       : message.content}
                   </p>
                   <p className={`msg-time ${message.role === "user" ? "user" : "assistant"}`}>

@@ -353,6 +353,16 @@ button {
   line-height: 1.52;
 }
 
+.message-bubble.assistant a {
+  color: #1d4ed8;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.message-bubble.assistant a:hover {
+  color: #1e40af;
+}
+
 .msg-time {
   margin-top: 0.4rem !important;
   font-size: 0.72rem !important;
