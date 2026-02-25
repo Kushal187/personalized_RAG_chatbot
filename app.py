@@ -453,7 +453,45 @@ def run_content_guardrails(text: str, client: OpenAI) -> tuple[bool, list[str], 
     return len(errors) == 0, errors, warnings
 
 
-def run_query_guardrails(query: str, client: OpenAI) -> tuple[bool, Optional[str]]:
+def _is_contextual_followup_query(query: str, conversation_history: Optional[list[dict]] = None) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    followup_markers = [
+        "that", "this", "it", "those", "these", "more details", "expand on that",
+        "tell me more", "more about that", "go deeper", "elaborate",
+    ]
+    if not any(marker in q for marker in followup_markers):
+        return False
+    if not conversation_history:
+        return False
+    recent = conversation_history[-6:]
+    return any(m.get("role") == "assistant" and (m.get("content") or "").strip() for m in recent)
+
+
+def _augment_followup_query_with_recent_subject(
+    query: str,
+    conversation_history: Optional[list[dict]] = None,
+) -> str:
+    """Expand referential follow-up queries with the most recent recruiter question context."""
+    if not _is_contextual_followup_query(query, conversation_history):
+        return query
+    if not conversation_history:
+        return query
+    for m in reversed(conversation_history):
+        if m.get("role") != "user":
+            continue
+        prev = (m.get("content") or "").strip()
+        if prev and prev.strip().lower() != query.strip().lower():
+            return f"{query}\nRelated prior recruiter question: {prev}"
+    return query
+
+
+def run_query_guardrails(
+    query: str,
+    client: OpenAI,
+    conversation_history: Optional[list[dict]] = None,
+) -> tuple[bool, Optional[str]]:
     """
     Run all query-level guardrails.
     Returns: (passed, error_message)
@@ -466,6 +504,8 @@ def run_query_guardrails(query: str, client: OpenAI) -> tuple[bool, Optional[str
     # 2. Relevance check
     result = check_query_relevance(query, client)
     if not result.passed:
+        if _is_contextual_followup_query(query, conversation_history):
+            return True, None
         return False, "I'm designed to answer questions about job candidates and their resumes. Please ask something related to the uploaded resumes."
     
     return True, None
@@ -1039,12 +1079,61 @@ def extract_roles_from_experience(section_text: str) -> list[dict]:
     return roles
 
 
-def extract_entries_from_section(section_text: str, section_type: str) -> list[str]:
+def _split_experience_entries_fallback(section_text: str) -> list[dict]:
+    """
+    Fallback splitter for experience sections when date-range parsing collapses roles.
+    Uses date-anchor lines first, then paragraph blocks.
+    """
+    if not section_text or not section_text.strip():
+        return []
+
+    date_pattern = r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*\d{4}'
+    year_only = r'\d{4}'
+    date_range_pattern = rf'({date_pattern}|{year_only})\s*[-–—to]+\s*({date_pattern}|{year_only}|Present|Current)'
+
+    lines = section_text.split('\n')
+    anchors: list[int] = []
+    for i, line in enumerate(lines):
+        if re.search(date_range_pattern, line, re.IGNORECASE):
+            start = i
+            if i > 0:
+                prev = lines[i - 1].strip()
+                if prev and not prev.startswith(('•', '-', '*', '–', '▪')):
+                    start = i - 1
+            anchors.append(start)
+
+    anchors = sorted(set(anchors))
+    entries: list[str] = []
+    if anchors:
+        for idx, start in enumerate(anchors):
+            end = anchors[idx + 1] if idx + 1 < len(anchors) else len(lines)
+            chunk = "\n".join(lines[start:end]).strip()
+            if len(chunk) > 25:
+                entries.append(chunk)
+
+    if len(entries) < 2:
+        blocks = [b.strip() for b in re.split(r'\n\s*\n+', section_text) if b.strip()]
+        block_entries = [b for b in blocks if len(b) > 25]
+        if len(block_entries) > len(entries):
+            entries = block_entries
+
+    out = []
+    for e in entries:
+        out.append({"text": e, "company": _extract_company_from_role_text(e)})
+    return out
+
+
+def extract_entries_from_section(section_text: str, section_type: str) -> list[dict]:
     """Extract individual entries (roles, projects, education) from a section."""
     
     if section_type == "experience":
         roles = extract_roles_from_experience(section_text)
-        return [{"text": r["text"], "company": r.get("company")} for r in roles if r["text"].strip()]
+        entries = [{"text": r["text"], "company": r.get("company")} for r in roles if r["text"].strip()]
+        if len(entries) <= 1:
+            fallback_entries = _split_experience_entries_fallback(section_text)
+            if len(fallback_entries) > len(entries):
+                entries = fallback_entries
+        return entries
     
     elif section_type == "projects":
         # Split projects by project headers (usually Name | Tech Stack | Date)
@@ -1959,6 +2048,7 @@ RULES:
 4. Tone: Professional but personable. Be concise. Match the recruiter's level of formality. If you don't have information, say so honestly (e.g. "I don't have that on my resume" or "I'd need to check").
 5. Consistency: Stay consistent with what you've already said in this conversation. If the recruiter refers back to something (e.g. "that project you mentioned"), align with your earlier answers.
 6. Temporal grounding: Use the current date/time context below when using words like "recent", "currently", or "latest". Avoid calling old experiences "recent" when they are clearly not recent relative to today's date. Prefer explicit month/year phrasing when possible.
+7. No hallucinations: Do not invent technologies, metrics, tools, architecture names, or project details. If a detail is not explicitly in resume context, omit it.
 
 [CURRENT_DATETIME_CONTEXT]
 
@@ -2019,9 +2109,41 @@ def tool_semantic_search(
     if not query or not query.strip():
         return "Please provide a resume-related query."
     person_filter = me_person
+    query_clean = query.strip()
+
+    # Broad profile/experience queries should include fuller role coverage, not just top-k semantic hits.
+    if _is_broad_experience_query(query_clean):
+        try:
+            result = collection.get(
+                where={"person_name": {"$eq": me_person}},
+                include=["documents", "metadatas"],
+            )
+            docs = result.get("documents") or []
+            metas = result.get("metadatas") or [{}] * len(docs)
+            if docs:
+                priority = {"header": 0, "experience": 1, "education": 2, "projects": 3, "skills": 4, "other": 5}
+                rows = []
+                for idx, doc in enumerate(docs):
+                    meta = metas[idx] if idx < len(metas) else {}
+                    chunk_type = (meta.get("chunk_type") or "other").lower()
+                    rows.append({
+                        "text": doc or "",
+                        "chunk_type": chunk_type,
+                        "chunk_id": int(meta.get("chunk_id") or 0),
+                        "priority": priority.get(chunk_type, 6),
+                    })
+                rows.sort(key=lambda r: (r["priority"], r["chunk_id"]))
+                selected = rows[:40]
+                parts = []
+                for i, row in enumerate(selected, 1):
+                    parts.append(f"[{i}] ({row['chunk_type']})\n{row['text'][:700]}")
+                return "\n\n---\n\n".join(parts)
+        except Exception:
+            pass
+
     # Vector retrieval
     hits = retrieve_with_filters(
-        query,
+        query_clean,
         collection,
         openai_client,
         k=k,
@@ -2030,7 +2152,6 @@ def tool_semantic_search(
         known_names=list(st.session_state.resume_metadata.keys()) if hasattr(st, "session_state") and getattr(st.session_state, "resume_metadata", None) else None,
     )
     # Hybrid: if query looks like a company/term (short, 1-4 words), boost chunks that contain the query text
-    query_clean = query.strip()
     if me_person and query_clean and len(query_clean.split()) <= 4:
         try:
             # Get all chunks for this person and find any where query appears in text
@@ -2078,11 +2199,59 @@ def _extract_github_handles_from_text(text: str) -> set[str]:
     if not text:
         return set()
     handles = set()
-    for match in re.findall(r"github\.com/([A-Za-z0-9-]{1,39})", text, flags=re.IGNORECASE):
-        handle = (match or "").strip().strip("/").lower()
-        if handle and handle not in {"features", "topics", "marketplace", "orgs", "pricing"}:
-            handles.add(handle)
+    patterns = [
+        r"github\.com/([A-Za-z0-9-]{1,39})",
+        r"github\s*(?:\.|dot)?\s*com\s*/\s*([A-Za-z0-9-]{1,39})",
+        r"github\s*[:\-]\s*([A-Za-z0-9-]{1,39})",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            handle = (match or "").strip().strip("/").lower()
+            if handle and handle not in {"features", "topics", "marketplace", "orgs", "pricing"}:
+                handles.add(handle)
     return handles
+
+
+def _select_allowed_github_handle(query: str, allowed_handles: list[str]) -> Optional[str]:
+    if not allowed_handles:
+        return None
+    q = (query or "").lower()
+    normalized = sorted({h.lower() for h in allowed_handles if h})
+    for handle in normalized:
+        if handle in q:
+            return handle
+    return normalized[0] if normalized else None
+
+
+def _is_github_query(query: str) -> bool:
+    q = (query or "").lower()
+    return any(term in q for term in ["github", "git hub", "gihtub", "repo", "repos", "repository"])
+
+
+def _wants_repo_examples(query: str) -> bool:
+    q = (query or "").lower()
+    return any(term in q for term in ["repo", "repos", "repository", "repositories", "project", "projects", "examples"])
+
+
+def _is_github_error_result(text: str) -> bool:
+    t = (text or "").lower()
+    return t.startswith("github api error") or t.startswith("github search error") or t.startswith("no github results found")
+
+
+def _is_broad_experience_query(query: str) -> bool:
+    q = (query or "").lower().strip()
+    patterns = [
+        "tell me about yourself",
+        "introduce yourself",
+        "work experience",
+        "more details into your work experience",
+        "details into your work experience",
+        "walk me through your background",
+        "background",
+        "professional experience",
+        "career summary",
+    ]
+    return any(p in q for p in patterns)
 
 
 def _get_allowed_github_handles(collection, me_person: Optional[str]) -> list[str]:
@@ -2115,7 +2284,11 @@ def tool_github_search(
     if allowed:
         q_lower = query.lower()
         if not any(h in q_lower for h in allowed):
-            return "I can only search GitHub using a username that appears in your resume."
+            selected = _select_allowed_github_handle(query, sorted(allowed))
+            if selected:
+                query = selected if search_type == "users" else f"user:{selected}"
+            else:
+                return "I can only search GitHub using a username that appears in your resume."
 
     token = os.getenv("GITHUB_TOKEN")
     headers = {"Accept": "application/vnd.github.v3+json"}
@@ -2298,7 +2471,7 @@ def get_recent_memories(limit: int = 10, me_person: Optional[str] = None) -> str
         mems = [m for m in mems if isinstance(m, dict) and m.get("person") == me_person]
     else:
         mems = [m for m in mems if isinstance(m, dict)]
-    mems = [m for m in mems if m.get("source") in {"recruiter_context", "legacy"}]
+    mems = [m for m in mems if m.get("source") == "recruiter_context"]
     mems = mems[-limit:]
     if not mems:
         return ""
@@ -2368,6 +2541,57 @@ def _enforce_agent_response(answer: str, me_person: str, known_names: list[str])
     return answer
 
 
+def _ground_answer_with_semantic_context(
+    answer: str,
+    semantic_context_blocks: list[str],
+    user_message: str,
+    me_person: str,
+    client: OpenAI,
+) -> str:
+    """
+    Rewrite an answer so every factual claim is supported by retrieved resume context.
+    Unsupported claims are removed instead of guessed.
+    """
+    if not answer or not answer.strip() or not semantic_context_blocks:
+        return answer
+    context = "\n\n---\n\n".join(semantic_context_blocks[-4:])
+    prompt = """You are a strict factual editor for a resume assistant.
+
+Candidate: {me_person}
+User question: {user_message}
+
+Task:
+1. Keep only claims supported by the provided context.
+2. Remove unsupported numbers, technologies, metrics, and details.
+3. If a specific detail is uncertain, omit it instead of guessing.
+4. Keep first-person voice.
+5. Keep the response concise and coherent.
+
+Context:
+{context}
+
+Original answer:
+{answer}
+
+Return only the corrected answer text."""
+    try:
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt.format(
+                me_person=me_person,
+                user_message=user_message[:500],
+                context=context[:12000],
+                answer=answer[:4000],
+            )}],
+            temperature=0,
+            max_tokens=900,
+        )
+        corrected = (resp.choices[0].message.content or "").strip()
+        return corrected or answer
+    except Exception:
+        return answer
+
+
 def _is_self_summary_query(query: str) -> bool:
     q = (query or "").lower().strip()
     if not q:
@@ -2383,7 +2607,7 @@ def _is_self_summary_query(query: str) -> bool:
     return any(re.search(p, q) for p in patterns)
 
 
-def _build_profile_context_for_intro(collection, me_person: str, max_chunks: int = 16) -> str:
+def _build_profile_context_for_intro(collection, me_person: str, max_chunks: int = 40) -> str:
     """
     Build a broad, deterministic profile context so intro questions cover all major roles.
     """
@@ -2420,7 +2644,10 @@ def _build_profile_context_for_intro(collection, me_person: str, max_chunks: int
             })
 
         rows.sort(key=lambda r: (r["priority"], r["chunk_id"]))
-        selected = rows[:max_chunks]
+        experience_rows = [r for r in rows if r["chunk_type"] == "experience"]
+        non_experience_rows = [r for r in rows if r["chunk_type"] != "experience"]
+        selected = experience_rows[:25] + non_experience_rows[: max(0, max_chunks - 25)]
+        selected = selected[:max_chunks]
         parts = []
         for i, row in enumerate(selected, 1):
             parts.append(f"[Intro Source {i}: {row['chunk_type']}]\n{row['text'][:700]}")
@@ -2450,10 +2677,63 @@ def run_agent(
     system_content = system_content.replace("[MEMORY_CONTEXT]", memory_context if memory_context else "(No additional memory for this turn.)")
     known_names = list(st.session_state.resume_metadata.keys()) if "resume_metadata" in st.session_state else []
     allowed_github_handles = _get_allowed_github_handles(collection, me_person)
+
+    # Deterministic GitHub path: avoids model missing the username in tool args.
+    if _is_github_query(user_message):
+        if not allowed_github_handles:
+            return "I can't pull GitHub projects because I couldn't find a GitHub username/link in my indexed resume.", ["github_search"]
+        handle = _select_allowed_github_handle(user_message, allowed_github_handles) or allowed_github_handles[0]
+        if _wants_repo_examples(user_message):
+            repos_result = tool_github_search(
+                query=f"user:{handle}",
+                search_type="repositories",
+                allowed_handles=allowed_github_handles,
+            )
+            if _is_github_error_result(repos_result):
+                return (
+                    f"My GitHub is https://github.com/{handle}, but I couldn't fetch repository details right now.",
+                    ["github_search"],
+                )
+            return f"Here are examples from my GitHub (@{handle}):\n\n{repos_result}", ["github_search"]
+        profile_result = tool_github_search(
+            query=handle,
+            search_type="users",
+            allowed_handles=allowed_github_handles,
+        )
+        if _is_github_error_result(profile_result):
+            return f"My GitHub is https://github.com/{handle}.", ["github_search"]
+        return f"My GitHub is https://github.com/{handle}.\n\n{profile_result}", ["github_search"]
     
+    effective_query = _augment_followup_query_with_recent_subject(user_message, conversation_history)
+
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_content},
     ]
+    tools_used: list[str] = []
+    semantic_context_blocks: list[str] = []
+
+    # Deterministic semantic prefetch for resume questions so retrieval is always available.
+    if not _is_weather_query(user_message):
+        prefetch_k = 16 if _is_broad_experience_query(user_message) else 10
+        prefetch = tool_semantic_search(
+            effective_query,
+            collection,
+            client,
+            me_person,
+            k=prefetch_k,
+        )
+        if not prefetch.startswith("No matching resume excerpts found"):
+            semantic_context_blocks.append(prefetch)
+            tools_used.append("semantic_search")
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Prefetched resume excerpts for this question. "
+                    "Prioritize these grounded facts and do not invent missing details.\n\n"
+                    f"{prefetch[:12000]}"
+                ),
+            })
+
     if _is_self_summary_query(user_message):
         intro_context = _build_profile_context_for_intro(collection, me_person)
         if intro_context:
@@ -2465,11 +2745,16 @@ def run_agent(
                     f"{intro_context}"
                 ),
             })
-    for m in conversation_history[-20:]:  # Last 10 turns
-        messages.append({"role": m["role"], "content": m["content"]})
+    for m in conversation_history[-18:]:
+        role = m.get("role")
+        if role not in {"user", "assistant"}:
+            continue
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        messages.append({"role": role, "content": content[:1200]})
     messages.append({"role": "user", "content": user_message})
     
-    tools_used: list[str] = []
     max_rounds = 10
     for _ in range(max_rounds):
         resp = client.chat.completions.create(
@@ -2477,10 +2762,19 @@ def run_agent(
             messages=messages,
             tools=AGENT_TOOLS_DEF,
             tool_choice="auto",
+            temperature=0,
         )
         choice = resp.choices[0]
         if not choice.message.tool_calls:
-            final_answer = _enforce_agent_response(choice.message.content or "", me_person, known_names)
+            final_answer = choice.message.content or ""
+            final_answer = _ground_answer_with_semantic_context(
+                final_answer,
+                semantic_context_blocks,
+                user_message,
+                me_person,
+                client,
+            )
+            final_answer = _enforce_agent_response(final_answer, me_person, known_names)
             return final_answer, tools_used
         
         # Append assistant message with tool_calls once
@@ -2506,13 +2800,16 @@ def run_agent(
             elif name_tc == "web_search":
                 result = tool_web_search(args.get("query", ""))
             elif name_tc == "semantic_search":
+                tool_query = args.get("query", "")
+                tool_query = _augment_followup_query_with_recent_subject(tool_query, conversation_history)
                 result = tool_semantic_search(
-                    args.get("query", ""),
+                    tool_query,
                     collection,
                     client,
                     me_person,
                     k=8,
                 )
+                semantic_context_blocks.append(result)
             elif name_tc == "github_search":
                 if not allowed_github_handles:
                     result = "I can't use GitHub search because my resume does not include a GitHub username or profile URL."
@@ -2872,7 +3169,7 @@ if query := st.chat_input(chat_placeholder):
         st.stop()
 
     if st.session_state.collection is not None:
-        query_ok, query_error = run_query_guardrails(query, client)
+        query_ok, query_error = run_query_guardrails(query, client, st.session_state.messages[:-1])
         if not query_ok:
             with st.chat_message("assistant", avatar="🤖"):
                 st.warning(query_error)
