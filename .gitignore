@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 agent_memory.json
 
+# New fullstack app artifacts
+backend/data/
+frontend/node_modules/
+frontend/dist/
