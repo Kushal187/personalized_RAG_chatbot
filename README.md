@@ -1,279 +1,85 @@
-# 🎯 ResumeAI - Smart Candidate Search
+# ResumeAI (Render-Ready Fullstack)
 
-A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural language queries over multiple candidate resumes. In **agent mode**, the chatbot impersonates you in front of a recruiter: set your profile with "Set as me", then answer as yourself using your resume plus **web search** (Tavily), **semantic search** (your resume), and **GitHub search**. Includes a **memory layer** so the agent remembers recruiter context (e.g. company, follow-ups) across the conversation.
+This repo now includes a full UI revamp with:
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://resume-rag-kushal.streamlit.app/)
+- `frontend/` React + TypeScript (Vite)
+- `backend/` FastAPI + Python RAG pipeline
+- `render.yaml` blueprint to deploy both services on Render
 
-## 🚀 Live Demo
+The old Streamlit app remains in `app.py` as legacy code, but the new default architecture is frontend + backend.
 
-**[Try ResumeAI →](https://resume-rag-kushal.streamlit.app/)**
+## Architecture
 
----
+- Frontend uploads resume PDFs, triggers index build, and chats with the assistant.
+- Backend extracts PDF text, chunks resumes, embeds with OpenAI, stores vectors in Chroma, and answers recruiter-style questions.
+- Candidate metadata and vectors persist in `DATA_DIR`.
 
-## 📸 Screenshots
+## Project Structure
 
-### Landing Page
-![Empty State](screenshots/empty-state.png)
-*Clean interface prompting users to upload resumes and get started*
-
-### Loaded Candidates
-![Loaded Candidates](screenshots/demo.gif)
-*Demo*
-
----
-
-## 🛠️ Tech Stack
-
-| Technology | Purpose |
-|------------|---------|
-| **Python 3.8+** | Core programming language |
-| **Streamlit** | Web application framework & UI |
-| **OpenAI API** | Embeddings (`text-embedding-3-small`) and chat completions (`gpt-4o`, `gpt-4o-mini`) |
-| **ChromaDB** | In-memory vector database for semantic search |
-| **pdfplumber** | Primary PDF text extraction (complex layouts) |
-| **PyPDF2** | Fallback PDF text extraction |
-| **python-dotenv** | Environment variable management |
-| **tavily-python** | Web search for agent (e.g. weather, company info) |
-| **requests** | GitHub API for agent repo/profile search |
-
----
-
-## ✨ Features
-
-### Core Functionality
-- **📄 Multi-Resume Upload** — Drag and drop PDF resumes (max 2MB each)
-- **👤 Set as me (Option B)** — Designate one profile as "you"; the agent and retrieval are always scoped to that profile
-- **🤖 Agent mode** — When "Set as me" is set, the chatbot acts as you in a recruiter conversation: answers in first person using your resume and tools (web, semantic, GitHub)
-- **🔍 Semantic Search** — Find candidates (or your resume) based on skills, experience, and qualifications using vector similarity
-- **💬 Natural Language Queries** — Ask questions about candidates or, in agent mode, have the recruiter ask you anything
-- **🧠 Memory layer** — Persistent memory (file-backed) so the agent remembers recruiter name, company, follow-ups across turns
-- **📊 Real-time Metrics** — Track candidates, indexed chunks, questions asked, and "Your profile" status
-
-### Advanced RAG Pipeline
-- **LLM-based Metadata Extraction** — Automatically extracts name, skills, experience, companies, and education from resumes
-- **Semantic Chunking** — Intelligently splits resumes by sections (experience, skills, education, projects)
-- **Temporal Query Expansion** — Handles date-based queries ("What was John doing in December 2024?")
-- **Query Rewriting** — Resolves pronouns and contextual references using conversation history
-- **Multi-candidate Queries** — Supports comparison queries across all loaded candidates
-
-### Security & Guardrails
-- **File Validation** — Size limits, PDF magic byte verification
-- **Prompt Injection Detection** — Blocks malicious content in uploaded documents
-- **Query Guardrails** — Validates query relevance and blocks injection attempts
-- **Response Safety** — Filters sensitive information from generated responses
-- **Content Sanitization** — Removes suspicious Unicode and formatting
-
----
-
-## 📦 Installation
-
-### Prerequisites
-
-- Python 3.8+
-- OpenAI API key
-
-### Local Setup
-
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/yourusername/personalized_RAG_chatbot.git
-
-   cd personalized_RAG_chatbot
-   ```
-
-2. **Create a virtual environment**
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
-
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. **Set up environment variables**
-   
-   Create a `.env` file in the root directory:
-   ```env
-   OPENAI_API_KEY=your_openai_api_key_here
-   TAVILY_API_KEY=your_tavily_api_key_here   # For agent web search (get one at tavily.com)
-   GITHUB_TOKEN=your_github_token_here      # Optional; for higher GitHub API rate limits when agent searches repos
-   ```
-
-5. **Run the application**
-   ```bash
-   streamlit run app.py
-   ```
-
-6. **Open in browser**
-   
-   Navigate to `http://localhost:8501`
-
----
-
-
-## 📁 Project Structure
-
-```
-resumeai/
-├── app.py                 # Main Streamlit application
-├── requirements.txt       # Python dependencies
-├── .env                   # Environment variables (local only, not committed)
-├── .gitignore             # Git ignore file
-├── README.md              # Documentation
-└── screenshots/           # Application screenshots
-    ├── empty-state.png
-    └── demo.gif
+```text
+.
+├── backend/
+│   ├── app/
+│   │   ├── main.py
+│   │   ├── rag_engine.py
+│   │   └── schemas.py
+│   ├── requirements.txt
+│   └── .env.example
+├── frontend/
+│   ├── src/
+│   │   ├── App.tsx
+│   │   ├── api.ts
+│   │   ├── styles.css
+│   │   └── types.ts
+│   ├── package.json
+│   └── .env.example
+├── render.yaml
+└── app.py  # legacy Streamlit app
 ```
 
----
+## Local Development
 
-## 🔧 Configuration
+### 1. Backend
 
-### Environment Variables
-
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `OPENAI_API_KEY` | Your OpenAI API key for embeddings and chat | Yes |
-
-### Model Configuration
-
-The application uses the following OpenAI models (configurable in `app.py`):
-
-| Constant | Model | Purpose |
-|----------|-------|---------|
-| `EMBED_MODEL` | `text-embedding-3-small` | Document and query embeddings |
-| `CHAT_MODEL` | `gpt-4o-mini` | Query rewriting, temporal expansion |
-| `ANSWER_MODEL` | `gpt-4o` | Final answer generation |
-| `EXTRACTION_MODEL` | `gpt-4o-mini` | Resume metadata extraction |
-| `GUARDRAIL_MODEL` | `gpt-4o-mini` | Content validation |
-
-### Other Settings
-
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `MAX_FILE_SIZE_MB` | 2 | Maximum file size per resume |
-| `MAX_CONTEXT_TURNS` | 5 | Conversation turns to maintain |
-| `COLLECTION_NAME` | `resumes` | ChromaDB collection name |
-
----
-
-## 📝 Usage
-
-1. **Upload Resumes** — Use the sidebar to drag & drop or browse for PDF resumes 
-2. **Build Index** — Click the "Build" button to process and index the resumes
-3. **Ask Questions** — Type natural language queries in the chat input
-4. **Review Sources** — Expand the "Sources" section to see which resume chunks were used
-
-### Example Queries
-
-**Single Candidate**
-- "Tell me about John's experience"
-- "What skills does Sarah have?"
-
-**Temporal Queries**
-- "What was John doing in December 2024?"
-- "Where did Sarah work in 2023?"
-
-**Multi-Candidate**
-- "Who has experience with machine learning?"
-- "Compare candidates with Python skills"
-- "List all candidates with cloud experience"
-
-**Follow-up Questions**
-- "What about his education?" (resolves pronoun from context)
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   PDF Upload    │────▶│   Guardrails     │────▶│  Text Extract   │
-│   (Streamlit)   │     │  (File + Content)│     │ (pdfplumber/    │
-└─────────────────┘     └──────────────────┘     │  PyPDF2)        │
-                                                  └────────┬────────┘
-                                                           │
-                        ┌──────────────────┐               ▼
-                        │   LLM Metadata   │◀──────────────┤
-                        │   Extraction     │               │
-                        │   (gpt-4o-mini)  │               │
-                        └────────┬─────────┘               │
-                                 │                         │
-                                 ▼                         ▼
-                        ┌──────────────────┐     ┌─────────────────┐
-                        │ Semantic Chunking│     │   Sanitization  │
-                        │ (by section type)│     └─────────────────┘
-                        └────────┬─────────┘
-                                 │
-                                 ▼
-                        ┌──────────────────┐
-                        │    ChromaDB      │
-                        │ (Vector Store)   │
-                        └────────┬─────────┘
-                                 │
-┌─────────────────┐              │
-│   User Query    │──────────────┤
-└────────┬────────┘              │
-         │                       │
-         ▼                       │
-┌──────────────────┐             │
-│ Query Rewriting  │             │
-│ + Temporal       │             │
-│   Expansion      │             │
-└────────┬─────────┘             │
-         │                       │
-         ▼                       ▼
-┌──────────────────┐     ┌─────────────────┐
-│ Semantic Search  │◀────│   Embeddings    │
-│ (with filters)   │     │ (text-embed-3)  │
-└────────┬─────────┘     └─────────────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Answer Generation│
-│    (gpt-4o)      │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Response Safety  │
-│   Check          │
-└────────┬─────────┘
-         │
-         ▼
-    [ Response ]
+```bash
+cd backend
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# set OPENAI_API_KEY in .env
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
----
+### 2. Frontend
 
-## 🤝 Contributing
+```bash
+cd frontend
+cp .env.example .env
+# optionally set VITE_API_BASE_URL (default: http://localhost:8000)
+npm install
+npm run dev
+```
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Open `http://localhost:5173`.
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+## Render Deployment
 
----
+This repo includes `render.yaml` for two services:
 
-## 📄 License
+1. `resumeai-backend` (Web Service)
+2. `resumeai-frontend` (Static Site)
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+### Steps
 
----
+1. Push this repo to GitHub.
+2. In Render, create a new Blueprint and select the repo.
+3. Set `OPENAI_API_KEY` on `resumeai-backend`.
+4. Ensure frontend `VITE_API_BASE_URL` points to backend URL.
+5. Deploy.
 
-## 🙏 Acknowledgments
+## Notes
 
-- [Streamlit](https://streamlit.io/) for the web framework
-- [OpenAI](https://openai.com/) for embedding and language models
-- [ChromaDB](https://www.trychroma.com/) for vector storage
-
----
-
-<p align="center">
-  Made with ❤️ by Kushal
-</p>
+- Backend supports only PDF uploads.
+- Default per-file limit is controlled by `MAX_FILE_SIZE_MB` (default `2`).
+- For production persistence, keep a Render persistent disk mounted to `DATA_DIR` (configured as `/var/data` in `render.yaml`).

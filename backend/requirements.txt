@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+openai>=1.0.0
+chromadb
+PyPDF2
+pdfplumber
+python-dotenv
+requests
+tavily-python
