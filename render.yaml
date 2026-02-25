@@ -1,7 +1,7 @@
 services:
   - type: web
     name: resumeai-backend
-    env: python
+    runtime: python
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
@@ -20,13 +20,14 @@ services:
         value: gpt-4o-mini
       - key: EXTRACTION_MODEL
         value: gpt-4o-mini
-    disks:
-      - name: resumeai-data
-        mountPath: /var/data
-        sizeGB: 1
+    disk:
+      name: resumeai-data
+      mountPath: /var/data
+      sizeGB: 1
 
-  - type: static
+  - type: web
     name: resumeai-frontend
+    runtime: static
     rootDir: frontend
     buildCommand: npm ci && npm run build
     staticPublishPath: dist
