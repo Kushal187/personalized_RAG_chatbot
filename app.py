@@ -2110,6 +2110,9 @@ def tool_semantic_search(
         return "Please provide a resume-related query."
     person_filter = me_person
     query_clean = query.strip()
+    is_tech_query = _is_technology_query(query_clean)
+    known_companies = _get_known_companies_for_person(me_person)
+    mentioned_companies = _extract_company_mentions(query_clean, known_companies)
 
     # Broad profile/experience queries should include fuller role coverage, not just top-k semantic hits.
     if _is_broad_experience_query(query_clean):
@@ -2136,7 +2139,7 @@ def tool_semantic_search(
                 selected = rows[:40]
                 parts = []
                 for i, row in enumerate(selected, 1):
-                    parts.append(f"[{i}] ({row['chunk_type']})\n{row['text'][:700]}")
+                    parts.append(f"[{i}] ({row['chunk_type']})\n{row['text'][:1200]}")
                 return "\n\n---\n\n".join(parts)
         except Exception:
             pass
@@ -2151,10 +2154,10 @@ def tool_semantic_search(
         ensure_all_candidates=False,
         known_names=list(st.session_state.resume_metadata.keys()) if hasattr(st, "session_state") and getattr(st.session_state, "resume_metadata", None) else None,
     )
-    # Hybrid: if query looks like a company/term (short, 1-4 words), boost chunks that contain the query text
-    if me_person and query_clean and len(query_clean.split()) <= 4:
+    # Company-aware keyword boost for targeted follow-ups (works for long queries too).
+    if me_person and query_clean:
         try:
-            # Get all chunks for this person and find any where query appears in text
+            # Get all chunks for this person and find any where key terms appear in text.
             result = collection.get(
                 where={"person_name": {"$eq": me_person}},
                 include=["documents", "metadatas"],
@@ -2165,33 +2168,68 @@ def tool_semantic_search(
                 keyword_hits = []
                 seen_texts = set()
                 q_lower = query_clean.lower()
+                query_tokens = [t for t in re.findall(r"[a-zA-Z0-9+#.-]+", q_lower) if len(t) > 2]
+                text_needles = set()
+                if len(query_clean.split()) <= 4:
+                    text_needles.add(q_lower)
+                for comp in mentioned_companies:
+                    text_needles.add(comp.lower())
+                # For technology questions, anchor on company + implementation hints.
+                tech_needles = {"technology", "technologies", "tools", "framework", "stack", "implemented", "built", "using"}
+
                 for i, doc in enumerate(docs):
-                    if doc and q_lower in doc.lower():
-                        meta = metas[i] if i < len(metas) else {}
-                        key = (doc[:200], meta.get("chunk_id"))
-                        if key not in seen_texts:
-                            seen_texts.add(key)
-                            keyword_hits.append({
-                                "text": doc,
-                                "person_name": meta.get("person_name", me_person),
-                                "chunk_type": meta.get("chunk_type", "other"),
-                                "source_file": meta.get("source_file", ""),
-                                "skills": meta.get("skills", ""),
-                                "distance": 0.0,
-                            })
+                    if not doc:
+                        continue
+                    doc_lower = doc.lower()
+                    meta = metas[i] if i < len(metas) else {}
+
+                    company_match = any(comp.lower() in doc_lower for comp in mentioned_companies) if mentioned_companies else False
+                    token_overlap = sum(1 for t in query_tokens if t in doc_lower)
+                    direct_match = any(needle in doc_lower for needle in text_needles) if text_needles else False
+
+                    keep = direct_match or token_overlap >= 2
+                    if mentioned_companies:
+                        keep = keep and company_match
+                    if is_tech_query and keep:
+                        keep = _doc_has_tech_signal(doc) or any(t in doc_lower for t in tech_needles)
+                    if not keep:
+                        continue
+
+                    key = (doc[:200], meta.get("chunk_id"))
+                    if key in seen_texts:
+                        continue
+                    seen_texts.add(key)
+                    keyword_hits.append({
+                        "text": doc,
+                        "person_name": meta.get("person_name", me_person),
+                        "chunk_type": meta.get("chunk_type", "other"),
+                        "source_file": meta.get("source_file", ""),
+                        "skills": meta.get("skills", ""),
+                        "distance": 0.0,
+                    })
                 # Prepend keyword matches so they appear first; dedupe vector hits that are already in keyword_hits
                 if keyword_hits:
+                    # Prefer highly aligned chunks first.
+                    if mentioned_companies:
+                        keyword_hits.sort(
+                            key=lambda h: (
+                                0 if any(c.lower() in h["text"].lower() for c in mentioned_companies) else 1,
+                                0 if (_doc_has_tech_signal(h["text"]) if is_tech_query else False) else 1,
+                                len(h["text"]),
+                            ),
+                            reverse=False,
+                        )
                     vector_texts = {h["text"][:200] for h in hits}
                     keyword_only = [h for h in keyword_hits if h["text"][:200] not in vector_texts]
                     hits = keyword_only + [h for h in hits if h["text"][:200] not in {x["text"][:200] for x in keyword_only}]
-                    hits = hits[: k + len(keyword_only)]
+                    hits = hits[: max(k + len(keyword_only), k)]
         except Exception:
             pass
     if not hits:
         return "No matching resume excerpts found for that query."
     parts = []
     for i, h in enumerate(hits, 1):
-        parts.append(f"[{i}] ({h.get('chunk_type', 'other')})\n{h['text'][:600]}")
+        parts.append(f"[{i}] ({h.get('chunk_type', 'other')})\n{h['text'][:1200]}")
     return "\n\n---\n\n".join(parts)
 
 
@@ -2252,6 +2290,208 @@ def _is_broad_experience_query(query: str) -> bool:
         "career summary",
     ]
     return any(p in q for p in patterns)
+
+
+def _is_detailed_experience_query(query: str) -> bool:
+    q = (query or "").lower()
+    markers = [
+        "work experience",
+        "details into your work experience",
+        "give me details",
+        "more details",
+        "tell me more about your experience",
+    ]
+    return any(m in q for m in markers)
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+
+def _extract_experience_detail_lines(text: str, max_lines: int = 2) -> list[str]:
+    out: list[str] = []
+    lines = (text or "").splitlines()
+    skip_first = True
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if skip_first:
+            skip_first = False
+            continue
+        clean = re.sub(r"^[•\-\*\u2022\u25aa\u25cf]+\s*", "", line).strip()
+        if not clean:
+            continue
+        # Skip standalone date/location lines to keep detail lines substantive.
+        if re.fullmatch(r"[A-Za-z]{3,}\.?\s+\d{4}\s*[-–—to]+\s*(?:[A-Za-z]{3,}\.?\s+\d{4}|Present|Current|\d{4})", clean):
+            continue
+        if clean not in out:
+            out.append(clean)
+        if len(out) >= max_lines:
+            break
+    return out
+
+
+def _collect_experience_entries(collection, me_person: str) -> list[dict]:
+    """
+    Deterministically gather all distinct experience-like entries from indexed chunks.
+    """
+    if collection is None or not me_person:
+        return []
+    try:
+        result = collection.get(
+            where={"person_name": {"$eq": me_person}},
+            include=["documents", "metadatas"],
+        )
+        docs = result.get("documents") or []
+        metas = result.get("metadatas") or [{}] * len(docs)
+        date_range_pattern = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}\s*[-–—to]+\s*(?:Present|Current|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}|\d{4})|\b\d{4}\s*[-–—to]+\s*(?:Present|Current|\d{4})"
+        role_terms = [
+            "intern", "engineer", "assistant", "co-op", "teaching assistant",
+            "research assistant", "developer", "analyst", "specialist",
+        ]
+        non_experience_heading_terms = [
+            "gpa", "master of", "bachelor of", "education", "university",
+            "project", "patent", "skills", "certification", "coursework",
+            "technical skills", "publications", "achievements",
+        ]
+        generic_section_headers = {
+            "experience", "work experience", "professional experience", "employment history"
+        }
+
+        rows: list[dict] = []
+        for idx, doc in enumerate(docs):
+            text = (doc or "").strip()
+            if not text:
+                continue
+            meta = metas[idx] if idx < len(metas) else {}
+            chunk_type = (meta.get("chunk_type") or "other").lower()
+            text_lower = text.lower()
+            heading = _first_nonempty_line(text)
+            if not heading:
+                continue
+            heading_lower = heading.lower()
+            if heading_lower in generic_section_headers:
+                continue
+            if any(term in heading_lower for term in non_experience_heading_terms):
+                continue
+
+            has_date = bool(re.search(date_range_pattern, text, flags=re.IGNORECASE))
+            has_role_term = any(term in heading_lower for term in role_terms) or any(term in text_lower for term in role_terms)
+            looks_like_experience = (chunk_type == "experience" and has_date) or has_role_term
+            if not looks_like_experience:
+                continue
+            date_match = re.search(date_range_pattern, text, flags=re.IGNORECASE)
+            date_range = date_match.group(0) if date_match else ""
+            sort_year = 0
+            year_matches = re.findall(r"\b(19|20)\d{2}\b", date_range)
+            if year_matches:
+                try:
+                    sort_year = max(int(y) for y in re.findall(r"\b(?:19|20)\d{2}\b", date_range))
+                except Exception:
+                    sort_year = 0
+
+            rows.append({
+                "heading": heading,
+                "date_range": date_range,
+                "details": _extract_experience_detail_lines(text, max_lines=2),
+                "chunk_type": chunk_type,
+                "chunk_id": int(meta.get("chunk_id") or 0),
+                "sort_year": sort_year,
+            })
+
+        dedup: dict[str, dict] = {}
+        for row in rows:
+            key = _normalize_name(row["heading"])
+            if key not in dedup:
+                dedup[key] = row
+            else:
+                # Prefer richer entries (more details, has date).
+                prev = dedup[key]
+                prev_score = (1 if prev["date_range"] else 0) + len(prev["details"])
+                cur_score = (1 if row["date_range"] else 0) + len(row["details"])
+                if cur_score > prev_score:
+                    dedup[key] = row
+
+        entries = list(dedup.values())
+        entries.sort(
+            key=lambda r: (
+                r["sort_year"],
+                1 if r["chunk_type"] == "experience" else 0,
+                -r["chunk_id"],
+            ),
+            reverse=True,
+        )
+        return entries[:12]
+    except Exception:
+        return []
+
+
+def _format_experience_role_checklist(entries: list[dict], max_roles: int = 8) -> str:
+    if not entries:
+        return ""
+    lines = ["Expected experience roles from resume (cover these when giving broad summaries):"]
+    for e in entries[:max_roles]:
+        title = e.get("heading", "Experience")
+        date_range = e.get("date_range", "")
+        if date_range and date_range.lower() not in title.lower():
+            lines.append(f"- {title} ({date_range})")
+        else:
+            lines.append(f"- {title}")
+    return "\n".join(lines)
+
+
+def _is_technology_query(query: str) -> bool:
+    q = (query or "").lower()
+    terms = [
+        "technology", "technologies", "tech stack", "stack", "tools", "framework",
+        "frameworks", "languages", "used", "built with", "implemented with",
+    ]
+    return any(t in q for t in terms)
+
+
+def _get_known_companies_for_person(me_person: Optional[str]) -> list[str]:
+    if not me_person:
+        return []
+    try:
+        meta = st.session_state.resume_metadata.get(me_person)
+        if not meta:
+            return []
+        companies = meta.companies or []
+        cleaned = []
+        for c in companies:
+            c = (c or "").strip()
+            if len(c) >= 2:
+                cleaned.append(c)
+        return cleaned
+    except Exception:
+        return []
+
+
+def _extract_company_mentions(query: str, companies: list[str]) -> list[str]:
+    q = (query or "").lower()
+    hits = []
+    for company in companies:
+        c = company.lower().strip()
+        if not c:
+            continue
+        if re.search(rf"\b{re.escape(c)}\b", q):
+            hits.append(company)
+    return hits
+
+
+def _doc_has_tech_signal(text: str) -> bool:
+    t = (text or "").lower()
+    tech_terms = [
+        "python", "java", "kotlin", "typescript", "javascript", "react", "spring",
+        "node", "aws", "docker", "kubernetes", "sql", "nosql", "flask", "django",
+        "framework", "stack", "built", "implemented", "designed",
+    ]
+    return any(term in t for term in tech_terms)
 
 
 def _get_allowed_github_handles(collection, me_person: Optional[str]) -> list[str]:
@@ -2566,6 +2806,7 @@ Task:
 3. If a specific detail is uncertain, omit it instead of guessing.
 4. Keep first-person voice.
 5. Keep the response concise and coherent.
+6. Do not use speculative phrases like "might have", "likely", or "probably" about technologies.
 
 Context:
 {context}
@@ -2703,7 +2944,7 @@ def run_agent(
         if _is_github_error_result(profile_result):
             return f"My GitHub is https://github.com/{handle}.", ["github_search"]
         return f"My GitHub is https://github.com/{handle}.\n\n{profile_result}", ["github_search"]
-    
+
     effective_query = _augment_followup_query_with_recent_subject(user_message, conversation_history)
 
     messages: list[dict[str, Any]] = [
@@ -2734,6 +2975,34 @@ def run_agent(
                 ),
             })
 
+        # For technology-specific questions, run a second targeted prefetch to capture stack details.
+        if _is_technology_query(effective_query):
+            tech_prefetch_query = (
+                f"{effective_query} technologies tools tech stack frameworks "
+                f"languages implementation built using"
+            )
+            tech_prefetch = tool_semantic_search(
+                tech_prefetch_query,
+                collection,
+                client,
+                me_person,
+                k=max(prefetch_k, 14),
+            )
+            if (
+                tech_prefetch
+                and not tech_prefetch.startswith("No matching resume excerpts found")
+                and tech_prefetch not in semantic_context_blocks
+            ):
+                semantic_context_blocks.append(tech_prefetch)
+                tools_used.append("semantic_search")
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "Additional targeted excerpts for technology/tooling details:\n\n"
+                        f"{tech_prefetch[:12000]}"
+                    ),
+                })
+
     if _is_self_summary_query(user_message):
         intro_context = _build_profile_context_for_intro(collection, me_person)
         if intro_context:
@@ -2743,6 +3012,18 @@ def run_agent(
                     "Use this prefetched resume context for a complete intro. "
                     "Mention major internships/roles with dates and avoid saying older roles are 'recent'.\n\n"
                     f"{intro_context}"
+                ),
+            })
+    if _is_self_summary_query(user_message) or _is_detailed_experience_query(user_message):
+        entries = _collect_experience_entries(collection, me_person)
+        checklist = _format_experience_role_checklist(entries)
+        if checklist:
+            messages.append({
+                "role": "system",
+                "content": (
+                    f"{checklist}\n"
+                    "For broad prompts like 'tell me about yourself' or 'work experience', include each role briefly "
+                    "if supported by context. Keep a natural conversational style."
                 ),
             })
     for m in conversation_history[-18:]:
