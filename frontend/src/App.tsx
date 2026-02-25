@@ -1,4 +1,5 @@
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowLeft, Brain, MessageSquare, Sparkles, Upload, Zap } from "lucide-react";
 import { buildIndex, clearIndex, getStatus, sendChat } from "./api";
 import type { ChatMessage, StatusResponse } from "./types";
 
@@ -238,7 +239,9 @@ export default function App() {
         <header className="landing-header">
           <div className="landing-header-inner">
             <div className="logo-group">
-              <div className="logo-mark">K</div>
+              <div className="logo-mark">
+                <MessageSquare className="logo-icon" />
+              </div>
               <span className="logo-text">Kushal AI</span>
             </div>
             <button className="outline-btn" onClick={() => setView("chat")}>
@@ -249,7 +252,10 @@ export default function App() {
 
         <main className="landing-main">
           <section className="hero-section">
-            <div className="hero-chip">AI-Powered Recruitment Assistant</div>
+            <div className="hero-chip">
+              <Sparkles className="chip-icon" />
+              <span>AI-Powered Recruitment Assistant</span>
+            </div>
             <h1>
               Meet Kushal through
               <br />
@@ -269,17 +275,23 @@ export default function App() {
 
           <section className="feature-grid">
             <article className="feature-card">
-              <div className="feature-icon">AI</div>
+              <div className="feature-icon">
+                <Brain className="feature-icon-svg" />
+              </div>
               <h3>Intelligent Responses</h3>
               <p>Detailed answers about experience, projects, and technical expertise.</p>
             </article>
             <article className="feature-card">
-              <div className="feature-icon">PDF</div>
+              <div className="feature-icon">
+                <Upload className="feature-icon-svg" />
+              </div>
               <h3>Resume Analysis</h3>
               <p>Upload multiple resumes and keep responses grounded in real profile data.</p>
             </article>
             <article className="feature-card">
-              <div className="feature-icon">FAST</div>
+              <div className="feature-icon">
+                <Zap className="feature-icon-svg" />
+              </div>
               <h3>Instant Answers</h3>
               <p>Get immediate candidate-focused answers for recruiter workflows.</p>
             </article>
@@ -296,9 +308,14 @@ export default function App() {
       <header className="chat-header">
         <div className="chat-header-inner">
           <div className="chat-header-left">
-            <button className="ghost-btn" onClick={() => setView("landing")}>Back</button>
+            <button className="ghost-btn" onClick={() => setView("landing")}>
+              <ArrowLeft className="back-arrow" />
+              <span>Back</span>
+            </button>
             <div className="logo-group">
-              <div className="logo-mark">K</div>
+              <div className="logo-mark">
+                <span className="logo-k">K</span>
+              </div>
               <div>
                 <p className="logo-text">Kushal AI</p>
                 <p className="logo-subtext">Ask me anything about Kushal</p>

@@ -57,8 +57,17 @@ button {
   border-radius: 0.5rem;
   display: grid;
   place-items: center;
+}
+
+.logo-icon {
+  width: 1rem;
+  height: 1rem;
+}
+
+.logo-k {
+  font-size: 0.82rem;
   font-weight: 700;
-  font-size: 0.85rem;
+  line-height: 1;
 }
 
 .logo-text {
@@ -114,6 +123,14 @@ button {
   background: transparent;
   color: #0f172a;
   padding: 0.45rem 0.65rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+}
+
+.back-arrow {
+  width: 0.95rem;
+  height: 0.95rem;
 }
 
 .ghost-btn:hover {
@@ -144,6 +161,11 @@ button {
   font-size: 0.82rem;
   padding: 0.36rem 0.7rem;
   margin-bottom: 1.45rem;
+}
+
+.chip-icon {
+  width: 0.82rem;
+  height: 0.82rem;
 }
 
 .hero-section h1 {
@@ -177,10 +199,6 @@ button {
   gap: 2rem;
 }
 
-.feature-card {
-  text-align: left;
-}
-
 .feature-icon {
   width: 3rem;
   height: 3rem;
@@ -193,6 +211,11 @@ button {
   letter-spacing: 0.02em;
   font-weight: 700;
   margin-bottom: 0.95rem;
+}
+
+.feature-icon-svg {
+  width: 1.25rem;
+  height: 1.25rem;
 }
 
 .feature-card h3 {
