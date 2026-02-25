@@ -35,6 +35,19 @@ function formatTime(iso: string): string {
   });
 }
 
+function normalizeAssistantText(content: string): string {
+  return (
+    content
+      // bold / italic markdown
+      .replace(/\*\*(.*?)\*\*/g, "$1")
+      .replace(/__(.*?)__/g, "$1")
+      .replace(/\*(.*?)\*/g, "$1")
+      .replace(/_(.*?)_/g, "$1")
+      // markdown list markers using '*'
+      .replace(/^\s*\*\s+/gm, "- ")
+  );
+}
+
 export default function App() {
   const [view, setView] = useState<ViewMode>("landing");
   const [status, setStatus] = useState<StatusResponse>(initialStatus);
@@ -323,7 +336,11 @@ export default function App() {
               >
                 {message.role === "assistant" ? <div className="avatar assistant">K</div> : null}
                 <div className={`message-bubble ${message.role === "user" ? "user" : "assistant"}`}>
-                  <p>{message.content}</p>
+                  <p>
+                    {message.role === "assistant"
+                      ? normalizeAssistantText(message.content)
+                      : message.content}
+                  </p>
                   <p className={`msg-time ${message.role === "user" ? "user" : "assistant"}`}>
                     {formatTime(messageTimes[message.id] ?? new Date().toISOString())}
                   </p>
