@@ -783,10 +783,101 @@ def _detect_memory_recall_intent(query: str) -> Optional[str]:
     return None
 
 
+def classify_query_intent(
+    query: str,
+    conversation_history: Optional[list[dict]],
+    client: OpenAI,
+) -> dict[str, Any]:
+    """
+    Classify incoming recruiter message intent for routing.
+    Returns: {"intent": one_of(...), "is_pure_context": bool}
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"intent": "resume", "is_pure_context": False}
+
+    # Deterministic high-confidence intents.
+    if _detect_memory_recall_intent(q):
+        return {"intent": "memory_recall", "is_pure_context": False}
+    if _is_weather_query(q):
+        return {"intent": "weather", "is_pure_context": False}
+    if _is_github_query(q):
+        return {"intent": "github", "is_pure_context": False}
+
+    recent = []
+    if conversation_history:
+        for m in conversation_history[-6:]:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role in {"user", "assistant"} and content:
+                recent.append(
+                    f"{'Recruiter' if role == 'user' else 'Candidate'}: {content[:220]}"
+                )
+    history_text = "\n".join(recent) if recent else "(none)"
+
+    prompt = """Classify this recruiter message for a resume-chat assistant.
+Return JSON with:
+- intent: one of ["recruiter_context", "memory_recall", "weather", "github", "resume", "offtopic"]
+- is_pure_context: true/false
+
+Definitions:
+- recruiter_context: recruiter introduces self/company or follow-up logistics (name/company/time/timezone)
+- memory_recall: asks to recall stored logistics/identity ("what time did we agree")
+- weather: asks about weather/temperature/forecast
+- github: asks for GitHub profile/repos
+- resume: asks about candidate background/experience/skills/projects/education
+- offtopic: unrelated to above
+
+Set is_pure_context=true ONLY when the message is mostly logistics/intro and does NOT request resume details.
+If message contains both recruiter intro/logistics and resume questions, choose "resume" and is_pure_context=false.
+
+Recent conversation:
+{history}
+
+Message:
+{query}
+"""
+    try:
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt.format(history=history_text, query=q[:700]),
+                }
+            ],
+            temperature=0,
+            max_tokens=120,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads((resp.choices[0].message.content or "{}").strip())
+        intent = str(data.get("intent") or "").strip().lower()
+        pure = bool(data.get("is_pure_context", False))
+        allowed = {
+            "recruiter_context",
+            "memory_recall",
+            "weather",
+            "github",
+            "resume",
+            "offtopic",
+        }
+        if intent not in allowed:
+            intent = "resume"
+        return {"intent": intent, "is_pure_context": pure}
+    except Exception:
+        fields = _extract_recruiter_context_fields(q, client)
+        has_context = any(v for v in fields.values())
+        return {
+            "intent": "recruiter_context" if has_context else "resume",
+            "is_pure_context": bool(has_context),
+        }
+
+
 def run_query_guardrails(
     query: str,
     client: OpenAI,
     conversation_history: Optional[list[dict]] = None,
+    intent_hint: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """
     Run all query-level guardrails.
@@ -799,6 +890,21 @@ def run_query_guardrails(
             False,
             "I can't process that query. Please ask a question about the candidates.",
         )
+
+    if intent_hint == "offtopic":
+        return (
+            False,
+            "I'm designed to answer questions about job candidates and their resumes. Please ask something related to the uploaded resumes.",
+        )
+
+    if intent_hint in {
+        "recruiter_context",
+        "memory_recall",
+        "weather",
+        "github",
+        "resume",
+    }:
+        return True, None
 
     # Weather queries are explicitly supported via agent web_search tool.
     if _is_weather_query(query):
@@ -2627,6 +2733,54 @@ def tool_web_search(query: str) -> str:
         return f"Web search error: {str(e)}"
 
 
+def _summarize_weather_search_result(
+    user_query: str,
+    raw_result: str,
+    client: OpenAI,
+) -> str:
+    if not raw_result or not raw_result.strip():
+        return "I couldn't fetch live weather details right now."
+
+    blocked_prefixes = (
+        "Web search is only allowed",
+        "Web search is not available",
+        "Web search is not configured",
+        "Web search error",
+        "No web results found",
+    )
+    if raw_result.startswith(blocked_prefixes):
+        return raw_result
+
+    prompt = """You are summarizing weather tool output for a recruiter chat.
+User query: {query}
+
+Weather search output:
+{raw}
+
+Rules:
+1. Return 1-2 concise sentences.
+2. Use only facts present in the tool output.
+3. Prefer current temperature + condition if available.
+4. If data is unclear, say you couldn't determine exact weather.
+Return only the final response text."""
+    try:
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt.format(query=user_query[:300], raw=raw_result[:5000]),
+                }
+            ],
+            temperature=0,
+            max_tokens=140,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return out or "I couldn't determine the exact weather from available results."
+    except Exception:
+        return "I couldn't summarize live weather details right now."
+
+
 def tool_semantic_search(
     query: str,
     collection,
@@ -3427,18 +3581,44 @@ def add_memory(
 
 
 def get_recent_memories(limit: int = 10, me_person: Optional[str] = None) -> str:
-    """Return recent persistent memory entries for the agent. When me_person is set, only memories scoped to that person are included (avoids mixing different candidates)."""
-    mems: list[dict] = st.session_state.get("agent_memories", [])
-    if me_person:
-        mems = [m for m in mems if isinstance(m, dict) and m.get("person") == me_person]
-    else:
-        mems = [m for m in mems if isinstance(m, dict)]
-    mems = [m for m in mems if m.get("source") == "recruiter_context"]
-    mems = mems[-limit:]
-    if not mems:
+    """Return compact structured recruiter memory context for the agent."""
+    identities = _get_structured_memories(
+        me_person, memory_type="recruiter_identity", source="recruiter_context"
+    )[-limit:]
+    followups = _get_structured_memories(
+        me_person, memory_type="followup", source="recruiter_context"
+    )[-limit:]
+
+    def latest_value(entries: list[dict], key: str) -> Optional[str]:
+        for m in reversed(entries):
+            value = m.get("value") if isinstance(m.get("value"), dict) else {}
+            v = (value.get(key) if isinstance(value, dict) else None) or ""
+            v = str(v).strip()
+            if v:
+                return v
+        return None
+
+    recruiter_name = latest_value(identities, "recruiter_name")
+    recruiter_company = latest_value(identities, "recruiter_company")
+    day = latest_value(followups, "followup_day")
+    time_str = latest_value(followups, "followup_time")
+    timezone_str = latest_value(followups, "followup_timezone")
+    day, time_str, timezone_str = _normalize_followup_display_parts(
+        day, time_str, timezone_str
+    )
+
+    lines = []
+    if recruiter_name:
+        lines.append(f"- Recruiter name: {recruiter_name}")
+    if recruiter_company:
+        lines.append(f"- Recruiter company: {recruiter_company}")
+    if day or time_str or timezone_str:
+        followup_parts = [p for p in [day, time_str, timezone_str] if p]
+        lines.append(f"- Follow-up agreed: {' '.join(followup_parts)}")
+
+    if not lines:
         return ""
-    facts = [m["fact"] if isinstance(m, dict) else str(m) for m in mems]
-    return "Remembered context:\n" + "\n".join(f"- {f}" for f in facts)
+    return "Remembered context:\n" + "\n".join(lines)
 
 
 def _get_structured_memories(
@@ -3776,6 +3956,7 @@ def run_agent(
     client: OpenAI,
     collection,
     me_person: Optional[str],
+    intent_hint: Optional[str] = None,
 ) -> tuple[str, list[str]]:
     """
     Run the recruiter-impersonation agent with tool calling.
@@ -3799,6 +3980,15 @@ def run_agent(
         else []
     )
     allowed_github_handles = _get_allowed_github_handles(collection, me_person)
+
+    # Deterministic weather path: do not rely on model to decide tool-calls.
+    if intent_hint == "weather" or _is_weather_query(user_message):
+        weather_raw = tool_web_search(user_message)
+        weather_answer = _summarize_weather_search_result(
+            user_message, weather_raw, client
+        )
+        weather_answer = _enforce_agent_response(weather_answer, me_person, known_names)
+        return weather_answer, ["web_search"]
 
     # Deterministic GitHub path: avoids model missing the username in tool args.
     if _is_github_query(user_message):
@@ -4401,6 +4591,7 @@ chat_placeholder = (
 if query := st.chat_input(chat_placeholder):
     st.session_state.messages.append({"role": "user", "content": query})
     conversation_history = st.session_state.messages[:-1]
+    intent_info: dict[str, Any] = {"intent": "resume", "is_pure_context": False}
 
     with st.chat_message("user", avatar="👤"):
         st.markdown(query)
@@ -4414,10 +4605,15 @@ if query := st.chat_input(chat_placeholder):
         st.stop()
 
     if st.session_state.collection is not None and me_name:
+        intent_info = classify_query_intent(query, conversation_history, client)
+
         # Router lane 1: recruiter-context intake (name/company/follow-up logistics).
-        if _is_recruiter_context_query(query, client):
+        context_detected = intent_info.get("intent") == "recruiter_context" or (
+            _is_recruiter_context_query(query, client)
+        )
+        if context_detected:
             stored, reply = store_recruiter_context_from_query(query, me_name, client)
-            if stored:
+            if stored and intent_info.get("is_pure_context", False):
                 with st.chat_message("assistant", avatar="🤖"):
                     st.markdown(reply)
                     st.session_state.messages.append(
@@ -4426,18 +4622,24 @@ if query := st.chat_input(chat_placeholder):
                 st.stop()
 
         # Router lane 2: explicit memory recall questions.
-        recall_reply = answer_recruiter_memory_recall(query, me_name)
-        if recall_reply:
-            with st.chat_message("assistant", avatar="🤖"):
-                st.markdown(recall_reply)
-                st.session_state.messages.append(
-                    {"role": "assistant", "content": recall_reply}
-                )
-            st.stop()
+        if intent_info.get("intent") == "memory_recall" or _detect_memory_recall_intent(
+            query
+        ):
+            recall_reply = answer_recruiter_memory_recall(query, me_name)
+            if recall_reply:
+                with st.chat_message("assistant", avatar="🤖"):
+                    st.markdown(recall_reply)
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": recall_reply}
+                    )
+                st.stop()
 
     if st.session_state.collection is not None:
         query_ok, query_error = run_query_guardrails(
-            query, client, conversation_history
+            query,
+            client,
+            conversation_history,
+            intent_hint=intent_info.get("intent"),
         )
         if not query_ok:
             with st.chat_message("assistant", avatar="🤖"):
@@ -4462,6 +4664,7 @@ if query := st.chat_input(chat_placeholder):
                     client,
                     st.session_state.collection,
                     me_name,
+                    intent_hint=intent_info.get("intent"),
                 )
             response_check = check_response_safety(answer)
             if not response_check.passed:
@@ -4474,7 +4677,6 @@ if query := st.chat_input(chat_placeholder):
             if tools_used:
                 st.caption("🔧 Tools used: " + ", ".join(tools_used))
             st.session_state.messages.append({"role": "assistant", "content": answer})
-            summarize_and_store(query, answer, client, me_person=me_name)
     else:
         with st.chat_message("assistant", avatar="🤖"):
             msg = TARGET_RESUME_MISSING_ERROR
