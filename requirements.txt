@@ -6,5 +6,7 @@ numpy
 python-dotenv
 chromadb
 pdfplumber
+tavily-python
+requests
 
 

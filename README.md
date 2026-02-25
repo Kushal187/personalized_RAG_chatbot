@@ -1,6 +1,6 @@
 # 🎯 ResumeAI - Smart Candidate Search
 
-A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural language queries over multiple candidate resumes. Upload PDF resumes and ask questions about candidates using conversational AI.
+A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural language queries over multiple candidate resumes. In **agent mode**, the chatbot impersonates you in front of a recruiter: set your profile with "Set as me", then answer as yourself using your resume plus **web search** (Tavily), **semantic search** (your resume), and **GitHub search**. Includes a **memory layer** so the agent remembers recruiter context (e.g. company, follow-ups) across the conversation.
 
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://resume-rag-kushal.streamlit.app/)
 
@@ -33,6 +33,8 @@ A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural lang
 | **pdfplumber** | Primary PDF text extraction (complex layouts) |
 | **PyPDF2** | Fallback PDF text extraction |
 | **python-dotenv** | Environment variable management |
+| **tavily-python** | Web search for agent (e.g. weather, company info) |
+| **requests** | GitHub API for agent repo/profile search |
 
 ---
 
@@ -40,10 +42,12 @@ A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural lang
 
 ### Core Functionality
 - **📄 Multi-Resume Upload** — Drag and drop PDF resumes (max 2MB each)
-- **🔍 Semantic Search** — Find candidates based on skills, experience, and qualifications using vector similarity
-- **💬 Natural Language Queries** — Ask questions like "Who has Python experience?" or "Compare candidates with ML background"
-- **🧠 Conversation Context** — Maintains context across questions with pronoun resolution ("What about his education?")
-- **📊 Real-time Metrics** — Track candidates, indexed chunks, and questions asked
+- **👤 Set as me (Option B)** — Designate one profile as "you"; the agent and retrieval are always scoped to that profile
+- **🤖 Agent mode** — When "Set as me" is set, the chatbot acts as you in a recruiter conversation: answers in first person using your resume and tools (web, semantic, GitHub)
+- **🔍 Semantic Search** — Find candidates (or your resume) based on skills, experience, and qualifications using vector similarity
+- **💬 Natural Language Queries** — Ask questions about candidates or, in agent mode, have the recruiter ask you anything
+- **🧠 Memory layer** — Persistent memory (file-backed) so the agent remembers recruiter name, company, follow-ups across turns
+- **📊 Real-time Metrics** — Track candidates, indexed chunks, questions asked, and "Your profile" status
 
 ### Advanced RAG Pipeline
 - **LLM-based Metadata Extraction** — Automatically extracts name, skills, experience, companies, and education from resumes
@@ -93,6 +97,8 @@ A RAG (Retrieval-Augmented Generation) powered chatbot that enables natural lang
    Create a `.env` file in the root directory:
    ```env
    OPENAI_API_KEY=your_openai_api_key_here
+   TAVILY_API_KEY=your_tavily_api_key_here   # For agent web search (get one at tavily.com)
+   GITHUB_TOKEN=your_github_token_here      # Optional; for higher GitHub API rate limits when agent searches repos
    ```
 
 5. **Run the application**

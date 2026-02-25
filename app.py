@@ -1,8 +1,9 @@
 import os
 import re
 import json
+import requests
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 from dataclasses import dataclass, asdict
 
 import streamlit as st
@@ -11,6 +12,11 @@ import chromadb
 from chromadb.config import Settings
 from dotenv import load_dotenv
 
+try:
+    from tavily import TavilyClient
+    TAVILY_AVAILABLE = True
+except ImportError:
+    TAVILY_AVAILABLE = False
 
 import re
 from dataclasses import dataclass
@@ -358,6 +364,30 @@ def check_response_safety(response: str) -> GuardrailResult:
                 severity="error"
             )
     
+    # Agent guardrail: don't reveal AI/language model identity
+    # Avoid matching job titles like "assistant professor", "research assistant"
+    # Allow "AI" in job titles: "AI Engineer", "Generative AI Engineer", "AI researcher", etc.
+    # Allow general references to LLM technology (e.g. "built LLM tools", "LLM-based")
+    ai_job_title_lookahead = (
+        r"(?!\s+engineer)(?!\s+researcher)(?!\s+developer)(?!\s+scientist)"
+        r"(?!\s+specialist)(?!\s+co-?op)(?!\s+intern)(?!\s+tools)"
+        r"(?!\s+model)(?!\s+application)(?!\s+platform)"
+    )
+    ai_reveal_patterns = [
+        r"\bas (a|an) (ai|language model)\b" + ai_job_title_lookahead,
+        r"\bi('m| am) (a|an) (ai|language model)\b" + ai_job_title_lookahead,
+        r"\b(i'm|i am) (an? )?assistant\b(?!\s+professor)(?!\s+at\s)",
+        r"\bopenai\b",
+        r"\bi('m| am) (a|an) llm\b",
+    ]
+    for pattern in ai_reveal_patterns:
+        if re.search(pattern, response, re.IGNORECASE):
+            return GuardrailResult(
+                passed=False,
+                reason="Response may reveal AI identity",
+                severity="error"
+            )
+    
     return GuardrailResult(passed=True)
 
 
@@ -475,7 +505,8 @@ except ImportError:
 
 from PyPDF2 import PdfReader
 
-load_dotenv()
+# Load .env from the same directory as this file (so it works regardless of cwd when running streamlit)
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 # Config
 EMBED_MODEL = "text-embedding-3-small"
@@ -484,6 +515,7 @@ ANSWER_MODEL = "gpt-4o"
 EXTRACTION_MODEL = "gpt-4o-mini"
 COLLECTION_NAME = "resumes"
 MAX_CONTEXT_TURNS = 5
+AGENT_MEMORY_FILE = Path(__file__).resolve().parent / "agent_memory.json"
 
 st.set_page_config(
     page_title="ResumeAI | Smart Candidate Search",
@@ -781,7 +813,8 @@ Return ONLY valid JSON with these exact fields:
 }
 
 Be precise. If information is not clearly present, use null for single values or empty arrays for lists.
-Do not invent or hallucinate information not present in the resume."""
+Do not invent or hallucinate information not present in the resume.
+For companies, list every employer mentioned (internships, co-ops, full-time, research)."""
 
     resp = client.chat.completions.create(
         model=EXTRACTION_MODEL,
@@ -825,9 +858,31 @@ Do not invent or hallucinate information not present in the resume."""
 
 
 # Semantic chunking based on resume sections
+def _extract_company_from_role_text(role_text: str) -> Optional[str]:
+    """Heuristic: extract company from first line (e.g. 'Title at Company', 'Company | Title')."""
+    if not role_text or not role_text.strip():
+        return None
+    first_line = role_text.strip().split("\n")[0].strip()
+    if not first_line:
+        return None
+    # "Software Engineer at Boeing" or "Boeing | Software Engineer" or "Boeing, Inc. – Software Engineer"
+    for sep in [" at ", " | ", " – ", " - ", " — ", ", "]:
+        if sep in first_line:
+            parts = first_line.split(sep, 1)
+            if len(parts) == 2:
+                # Prefer the part that looks like a company (often shorter or has Inc/LLC)
+                a, b = parts[0].strip(), parts[1].strip()
+                if 2 <= len(a) <= 80 and not a.lower().startswith(("software", "engineer", "intern", "developer", "associate")):
+                    return a
+                if 2 <= len(b) <= 80 and not b.lower().startswith(("software", "engineer", "intern", "developer", "associate")):
+                    return b
+                return a if len(a) <= len(b) else b
+    return None
+
+
 def identify_section_type(text: str) -> str:
     text_lower = text.lower()[:500]
-    if any(kw in text_lower for kw in ["experience", "work history", "employment", "professional background"]):
+    if any(kw in text_lower for kw in ["experience", "work history", "employment", "professional background", "internships", "co-op", "coop", "research experience", "positions"]):
         return "experience"
     if any(kw in text_lower for kw in ["skill", "technologies", "tools", "proficiencies", "competencies", "technical"]):
         return "skills"
@@ -851,17 +906,18 @@ def extract_roles_from_experience(section_text: str) -> list[dict]:
     # "Software Engineer at Meta | May 2025 - Present"
     # "Software Engineer, Meta (May 2025 - Present)"
     
-    # Date patterns
+    # Date patterns: month-year and year-only (e.g. "Jun 2022" or "2022 - 2023")
     date_pattern = r'(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*\d{4}'
-    date_range_pattern = rf'({date_pattern})\s*[-–—to]+\s*({date_pattern}|Present|Current)'
+    year_only = r'\d{4}'
+    date_range_pattern = rf'({date_pattern}|{year_only})\s*[-–—to]+\s*({date_pattern}|{year_only}|Present|Current)'
     
     # Split by date ranges (each role typically has a date range)
-    # Find all date range positions
     matches = list(re.finditer(date_range_pattern, section_text, re.IGNORECASE))
     
     if not matches:
-        # No date ranges found, return whole section as one chunk
-        return [{"text": section_text, "company": None, "title": None}]
+        # No date ranges found, return whole section as one chunk; try to extract company from first line
+        company = _extract_company_from_role_text(section_text)
+        return [{"text": section_text, "company": company, "title": None}]
     
     # Extract roles based on date range positions
     for i, match in enumerate(matches):
@@ -905,10 +961,7 @@ def extract_roles_from_experience(section_text: str) -> list[dict]:
             prev_role_end = role_end
         
         role_text = section_text[role_start:role_end].strip()
-        
-        # Try to extract company name from the role text
-        company = None
-        # Look for company names in metadata.companies or extract from text
+        company = _extract_company_from_role_text(role_text)
         first_line = role_text.split('\n')[0] if role_text else ""
         
         roles.append({
@@ -926,7 +979,7 @@ def extract_entries_from_section(section_text: str, section_type: str) -> list[s
     
     if section_type == "experience":
         roles = extract_roles_from_experience(section_text)
-        return [r["text"] for r in roles if r["text"].strip()]
+        return [{"text": r["text"], "company": r.get("company")} for r in roles if r["text"].strip()]
     
     elif section_type == "projects":
         # Split projects by project headers (usually Name | Tech Stack | Date)
@@ -959,7 +1012,7 @@ def extract_entries_from_section(section_text: str, section_type: str) -> list[s
         
         # Filter out section header if it's the only "entry"
         entries = [e.strip() for e in entries if e.strip() and len(e.strip()) > 20]
-        return entries if entries else [section_text]
+        return [{"text": e, "company": None} for e in (entries if entries else [section_text])]
     
     elif section_type == "education":
         # Split by university/school names or degree entries
@@ -1010,19 +1063,19 @@ def extract_entries_from_section(section_text: str, section_type: str) -> list[s
                 i += 1
             entries = combined
         
-        return entries if entries else [section_text]
+        return [{"text": e, "company": None} for e in (entries if entries else [section_text])]
     
-    # For other sections (skills, summary, etc.), keep as single chunk
-    return [section_text]
+    # For other sections (skills, summary, etc.), keep as single chunk (same shape: dict with text, company)
+    return [{"text": section_text, "company": None}]
 
 
 def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMetadata]:
     """Chunk resume by sections and individual entries (roles, projects, etc.)."""
     text = normalize_text(text)
     
-    # Section header patterns
+    # Section header patterns (include Internships, Co-op, Research so they chunk like experience)
     section_headers = [
-        r'^\s*(EXPERIENCE|WORK EXPERIENCE|PROFESSIONAL EXPERIENCE|EMPLOYMENT HISTORY)',
+        r'^\s*(EXPERIENCE|WORK EXPERIENCE|PROFESSIONAL EXPERIENCE|EMPLOYMENT HISTORY|INTERNSHIPS?|CO-OP|COOP|RESEARCH EXPERIENCE|POSITIONS?)',
         r'^\s*(EDUCATION|ACADEMIC BACKGROUND)',
         r'^\s*(SKILLS|TECHNICAL SKILLS|TECHNOLOGIES|CORE COMPETENCIES)',
         r'^\s*(PROJECTS|PERSONAL PROJECTS|ACADEMIC PROJECTS|SIDE PROJECTS)',
@@ -1072,11 +1125,12 @@ def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMeta
     chunk_id = 0
     
     for section_type, section_text in sections:
-        # Extract individual entries from the section
-        entries = extract_entries_from_section(section_text, section_type)
+        # Extract individual entries from the section (each entry: {"text": ..., "company": ...})
+        raw_entries = extract_entries_from_section(section_text, section_type)
         
-        for entry in entries:
-            entry = entry.strip()
+        for entry_obj in raw_entries:
+            entry = (entry_obj["text"] if isinstance(entry_obj, dict) else entry_obj).strip()
+            chunk_company = entry_obj.get("company") if isinstance(entry_obj, dict) else None
             entry_lower = entry.lower()
             injection_phrases = [
                 'no matter what question',
@@ -1092,12 +1146,17 @@ def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMeta
             if any(phrase in entry_lower for phrase in injection_phrases):
                 continue
             
-            # Different minimum sizes for different section types
-            # Education entries can be short (just school + degree + date)
-            min_size = 30 if section_type == "education" else 50
+            # Different minimum sizes: education and experience can have short entries (e.g. one role header)
+            min_size = 30 if section_type in ("education", "experience") else 50
             
             if not entry or len(entry) < min_size:
                 continue
+            
+            # Companies for this chunk: per-chunk company (e.g. Boeing) + global from metadata
+            companies_list = list(metadata.companies[:5])
+            if chunk_company and chunk_company not in companies_list:
+                companies_list = [chunk_company] + companies_list[:4]
+            companies_str = ",".join(companies_list[:5])
             
             # If entry is still too long (>1500 chars), split by sentences
             if len(entry) > 1500:
@@ -1115,7 +1174,7 @@ def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMeta
                                 chunk_id=chunk_id,
                                 chunk_type=section_type,
                                 skills=",".join(metadata.skills[:10]),
-                                companies=",".join(metadata.companies[:5]),
+                                companies=companies_str,
                                 experience_years=metadata.experience_years or 0,
                                 text=current_chunk.strip()
                             ))
@@ -1128,7 +1187,7 @@ def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMeta
                         chunk_id=chunk_id,
                         chunk_type=section_type,
                         skills=",".join(metadata.skills[:10]),
-                        companies=",".join(metadata.companies[:5]),
+                        companies=companies_str,
                         experience_years=metadata.experience_years or 0,
                         text=current_chunk.strip()
                     ))
@@ -1140,7 +1199,7 @@ def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMeta
                     chunk_id=chunk_id,
                     chunk_type=section_type,
                     skills=",".join(metadata.skills[:10]),
-                    companies=",".join(metadata.companies[:5]),
+                    companies=companies_str,
                     experience_years=metadata.experience_years or 0,
                     text=entry
                 ))
@@ -1154,7 +1213,7 @@ def semantic_chunk_resume(text: str, metadata: ResumeMetadata) -> list[ChunkMeta
             chunk_id=chunk_id,
             chunk_type="other",
             skills=",".join(metadata.skills[:10]),
-            companies=",".join(metadata.companies[:5]),
+            companies=",".join(metadata.companies[:5]) if metadata.companies else "",
             experience_years=metadata.experience_years or 0,
             text=text[:2000]  # First 2000 chars as fallback
         ))
@@ -1716,6 +1775,377 @@ Answer:"""
     return resp.choices[0].message.content
 
 
+# ============================================================
+# AGENT: Tools + run_agent (recruiter-impersonation)
+# ============================================================
+# Where agents fit in the flow:
+# 1. User uploads PDFs, clicks Build → text extracted, chunked (semantic_chunk_resume),
+#    embedded and stored in Chroma (build_collection). resume_metadata and collection live in session.
+# 2. User sets "Set as me" on a profile → me_person is set.
+# 3. When the user sends a chat message and me_person is set, we run the AGENT (run_agent)
+#    instead of plain RAG. The agent is an LLM that can call tools:
+#    - semantic_search: queries Chroma (retrieve_with_filters) over the user's resume chunks.
+#    - web_search: Tavily for weather, news, etc.
+#    - github_search: GitHub API for repos.
+# 4. So "What did you do at Boeing?" → agent calls semantic_search("Boeing"); retrieval
+#    returns matching chunks (now with hybrid: vector + keyword match); agent answers from those chunks.
+# ============================================================
+
+AGENT_SYSTEM_PROMPT_TEMPLATE = """You are [NAME]. You are in a live chat with a recruiter who is asking you questions as if in an informal screening or networking conversation. Your goal is to answer exactly as you would in real life: as yourself, based on your real resume, experience, and public presence.
+
+RULES:
+1. Identity: You are [NAME] and ONLY [NAME]. Never break character. Do not say you are an AI, assistant, or language model. Answer in first person as [NAME]. Never mention or use information about any other person (e.g. other candidates or names that are not you). If the search results or memory mention someone else, ignore that—only use information that is clearly about you, [NAME].
+2. Ground answers in facts: Use the semantic_search tool to look up your resume whenever the recruiter asks about your background, skills, experience, education, or projects. The search returns only YOUR resume chunks (for [NAME]). Base your answer only on those results. For questions about a specific company or role (e.g. "What did you do at Boeing?"), call semantic_search with the company or employer name (e.g. "Boeing" or "experience at Boeing") so resume chunks about that employer are found. Only state things supported by the search results or by web/GitHub search when relevant. If semantic_search returns no matching excerpts, say honestly that you don't have that in your resume or the information you have.
+3. Real-time and public info: Use web_search ONLY when the recruiter asks about the weather (e.g. "what's the weather in Boston?"). For weather questions, call web_search with a query like "weather in [city]". Do NOT use web_search for company info, news, or any other topic—for those, say you don't have that information or it's not available. For GitHub: first use semantic_search with queries like "GitHub" or "github username" or "profile link" to see if your resume lists your GitHub. Only if you find a GitHub username or profile URL in the search results, call github_search with that username (e.g. search_type "users" with query "username", or "repositories" with query "user:username" to get that user's repos). If your resume does not contain your GitHub username or link, do not guess—tell the recruiter honestly that you don't have your GitHub on your resume and they can ask you for it. If web_search returns that it is "not configured" or "not available", tell the recruiter: "Weather search isn't set up on this app yet. Add TAVILY_API_KEY to the .env file to enable weather (get a free key at https://tavily.com)."
+4. Tone: Professional but personable. Be concise. Match the recruiter's level of formality. If you don't have information, say so honestly (e.g. "I don't have that on my resume" or "I'd need to check").
+5. Consistency: Stay consistent with what you've already said in this conversation. If the recruiter refers back to something (e.g. "that project you mentioned"), align with your earlier answers.
+
+[MEMORY_CONTEXT]"""
+
+
+def _is_weather_query(query: str) -> bool:
+    """Return True only if the query is clearly about weather (web search is restricted to weather only)."""
+    if not query or not query.strip():
+        return False
+    q = query.lower().strip()
+    weather_terms = [
+        "weather", "temperature", "forecast", "temp ", " temp",
+        "degrees", "rain", "snow", "sunny", "cloudy", "humid",
+        "how hot", "how cold", "will it rain", "will it snow",
+    ]
+    return any(term in q for term in weather_terms)
+
+
+def tool_web_search(query: str) -> str:
+    """Web search via Tavily. Allowed only for weather queries; all other uses are blocked."""
+    if not _is_weather_query(query):
+        return "Web search is only allowed for weather queries. For other topics (news, company info, etc.) tell the recruiter you don't have that information or it's not available in this app."
+    if not TAVILY_AVAILABLE:
+        return "Web search is not available (tavily-python not installed or import failed). Tell the user: to enable weather and live info, install tavily-python and set TAVILY_API_KEY in .env (get a key at https://tavily.com)."
+    api_key = (os.getenv("TAVILY_API_KEY") or "").strip().strip('"\'')
+    if not api_key:
+        return "Web search is not configured (TAVILY_API_KEY not set). Tell the user: to enable weather and other live information, add TAVILY_API_KEY to the .env file. Get a free API key at https://tavily.com ."
+    try:
+        client = TavilyClient(api_key=api_key)
+        response = client.search(query=query, search_depth="basic", max_results=5)
+        results = response.get("results", [])
+        if not results:
+            return "No web results found for that query."
+        parts = []
+        for i, r in enumerate(results[:5], 1):
+            title = r.get("title", "")
+            content = r.get("content", "")[:400]
+            url = r.get("url", "")
+            parts.append(f"{i}. {title}\n{content}\nSource: {url}")
+        return "\n\n".join(parts)
+    except Exception as e:
+        return f"Web search error: {str(e)}"
+
+
+def tool_semantic_search(
+    query: str,
+    collection,
+    openai_client: OpenAI,
+    me_person: Optional[str],
+    k: int = 8,
+) -> str:
+    """Search over the user's resume (ChromaDB). Returns top-k chunks. Uses hybrid: vector + keyword match for company names."""
+    if collection is None:
+        return "Resume search is not available (no collection built)."
+    person_filter = me_person
+    # Vector retrieval
+    hits = retrieve_with_filters(
+        query,
+        collection,
+        openai_client,
+        k=k,
+        person_filter=person_filter,
+        ensure_all_candidates=False,
+        known_names=list(st.session_state.resume_metadata.keys()) if hasattr(st, "session_state") and getattr(st.session_state, "resume_metadata", None) else None,
+    )
+    # Hybrid: if query looks like a company/term (short, 1-4 words), boost chunks that contain the query text
+    query_clean = query.strip()
+    if me_person and query_clean and len(query_clean.split()) <= 4:
+        try:
+            # Get all chunks for this person and find any where query appears in text
+            result = collection.get(
+                where={"person_name": {"$eq": me_person}},
+                include=["documents", "metadatas"],
+            )
+            if result and result.get("documents") and result["documents"]:
+                docs = result["documents"]
+                metas = result.get("metadatas") or [{}] * len(docs)
+                keyword_hits = []
+                seen_texts = set()
+                q_lower = query_clean.lower()
+                for i, doc in enumerate(docs):
+                    if doc and q_lower in doc.lower():
+                        meta = metas[i] if i < len(metas) else {}
+                        key = (doc[:200], meta.get("chunk_id"))
+                        if key not in seen_texts:
+                            seen_texts.add(key)
+                            keyword_hits.append({
+                                "text": doc,
+                                "person_name": meta.get("person_name", me_person),
+                                "chunk_type": meta.get("chunk_type", "other"),
+                                "source_file": meta.get("source_file", ""),
+                                "skills": meta.get("skills", ""),
+                                "distance": 0.0,
+                            })
+                # Prepend keyword matches so they appear first; dedupe vector hits that are already in keyword_hits
+                if keyword_hits:
+                    vector_texts = {h["text"][:200] for h in hits}
+                    keyword_only = [h for h in keyword_hits if h["text"][:200] not in vector_texts]
+                    hits = keyword_only + [h for h in hits if h["text"][:200] not in {x["text"][:200] for x in keyword_only}]
+                    hits = hits[: k + len(keyword_only)]
+        except Exception:
+            pass
+    if not hits:
+        return "No matching resume excerpts found for that query."
+    parts = []
+    for i, h in enumerate(hits, 1):
+        parts.append(f"[{i}] ({h.get('chunk_type', 'other')})\n{h['text'][:600]}")
+    return "\n\n---\n\n".join(parts)
+
+
+def tool_github_search(query: str, search_type: str = "repositories") -> str:
+    """GitHub search (repositories or users). Requires GITHUB_TOKEN for higher rate limits."""
+    token = os.getenv("GITHUB_TOKEN")
+    headers = {"Accept": "application/vnd.github.v3+json"}
+    if token:
+        headers["Authorization"] = f"token {token}"
+    base = "https://api.github.com/search"
+    if search_type == "users":
+        url = f"{base}/users"
+    else:
+        url = f"{base}/repositories"
+    try:
+        r = requests.get(url, params={"q": query}, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return f"GitHub API error: {r.status_code} - {r.text[:300]}"
+        data = r.json()
+        items = data.get("items", [])[:5]
+        if not items:
+            return "No GitHub results found for that query."
+        parts = []
+        for i, item in enumerate(items, 1):
+            if search_type == "users":
+                login = item.get("login", "")
+                name = item.get("name") or login
+                bio = (item.get("bio") or "")[:200]
+                parts.append(f"{i}. {name} (@{login})\n{bio}")
+            else:
+                full_name = item.get("full_name", "")
+                desc = (item.get("description") or "")[:200]
+                url = item.get("html_url", "")
+                parts.append(f"{i}. {full_name}\n{desc}\n{url}")
+        return "\n\n".join(parts)
+    except Exception as e:
+        return f"GitHub search error: {str(e)}"
+
+
+# OpenAI tool definitions for the agent
+AGENT_TOOLS_DEF = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for WEATHER ONLY. Use only when the recruiter asks about weather (e.g. 'what's the weather in X?'). Pass a query like 'weather in Boston'. Do not use for news, company info, or any other topic.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "semantic_search",
+            "description": "Search your resume / profile for your background, skills, experience, education, projects. Use whenever the recruiter asks about you. For questions about a specific company or role (e.g. 'What did you do at Boeing?'), use the company or employer name as the query (e.g. 'Boeing' or 'experience at Boeing') to retrieve relevant resume chunks.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Natural language query or company/employer name (e.g. 'Boeing', 'experience at X')"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "github_search",
+            "description": "Search GitHub for repositories or users. Only use when you have found the candidate's GitHub username or profile URL in semantic_search results (e.g. from resume). Pass that username as query; use search_type 'users' to find the profile or 'repositories' with query 'user:username' for their repos. Do not call this with a guessed or generic query if the resume does not mention GitHub.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "search_type": {"type": "string", "enum": ["repositories", "users"], "description": "Type of search"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+
+def _load_agent_memories() -> list[dict]:
+    """Load persistent memory from file. Returns list of {fact, person} dicts. Legacy format (list of strings) is converted to person=None."""
+    if not AGENT_MEMORY_FILE.exists():
+        return []
+    try:
+        with open(AGENT_MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("memories", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        out: list[dict] = []
+        for item in raw:
+            if isinstance(item, dict) and "fact" in item:
+                out.append({"fact": item["fact"], "person": item.get("person")})
+            elif isinstance(item, str):
+                out.append({"fact": item, "person": None})
+        return out
+    except Exception:
+        return []
+
+
+def _save_agent_memories(memories: list[dict]) -> None:
+    """Save persistent memory to file. Expects list of {fact, person} dicts."""
+    try:
+        with open(AGENT_MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"memories": memories}, f, indent=0)
+    except Exception:
+        pass
+
+
+def add_memory(fact: str, person: Optional[str] = None) -> None:
+    """Append a fact to the agent's persistent memory, optionally scoped to a person (the 'me' candidate)."""
+    if not fact or not fact.strip():
+        return
+    mems = st.session_state.get("agent_memories", [])
+    mems.append({"fact": fact.strip(), "person": person})
+    st.session_state.agent_memories = mems
+    _save_agent_memories(mems)
+
+
+def get_recent_memories(limit: int = 10, me_person: Optional[str] = None) -> str:
+    """Return recent persistent memory entries for the agent. When me_person is set, only memories scoped to that person are included (avoids mixing different candidates)."""
+    mems: list[dict] = st.session_state.get("agent_memories", [])
+    if me_person:
+        mems = [m for m in mems if isinstance(m, dict) and m.get("person") == me_person]
+    else:
+        mems = [m for m in mems if isinstance(m, dict)]
+    mems = mems[-limit:]
+    if not mems:
+        return ""
+    facts = [m["fact"] if isinstance(m, dict) else str(m) for m in mems]
+    return "Remembered context:\n" + "\n".join(f"- {f}" for f in facts)
+
+
+def summarize_and_store(user_msg: str, assistant_msg: str, client: OpenAI, me_person: Optional[str] = None) -> None:
+    """Optionally extract 0-3 facts from the exchange (recruiter name, company, follow-ups) and add to memory, scoped to me_person when in agent mode."""
+    prompt = """From this recruiter-candidate chat exchange, extract 0-3 short facts worth remembering for later in the conversation (e.g. recruiter name, company, role, follow-up date). If nothing worth remembering, return empty JSON.
+
+User (recruiter): {user}
+Assistant (candidate): {assistant}
+
+Return JSON: {{"facts": ["fact1", "fact2"]}}"""
+    try:
+        resp = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": prompt.format(user=user_msg[:500], assistant=assistant_msg[:500])}],
+            temperature=0,
+            max_tokens=200,
+        )
+        text = resp.choices[0].message.content or ""
+        if "{" in text:
+            data = json.loads(text.replace("```json", "").replace("```", "").strip())
+            for fact in data.get("facts", [])[:3]:
+                if isinstance(fact, str) and fact.strip():
+                    add_memory(fact.strip(), person=me_person)
+    except Exception:
+        pass
+
+
+def run_agent(
+    user_message: str,
+    conversation_history: list[dict],
+    memory_context: str,
+    client: OpenAI,
+    collection,
+    me_person: Optional[str],
+) -> tuple[str, list[str]]:
+    """
+    Run the recruiter-impersonation agent with tool calling.
+    Returns (final_answer, list of tool names used).
+    """
+    name = me_person or "The Candidate"
+    system_content = AGENT_SYSTEM_PROMPT_TEMPLATE.replace("[NAME]", name)
+    system_content = system_content.replace("[MEMORY_CONTEXT]", memory_context if memory_context else "(No additional memory for this turn.)")
+    
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_content},
+    ]
+    for m in conversation_history[-20:]:  # Last 10 turns
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": user_message})
+    
+    tools_used: list[str] = []
+    max_rounds = 10
+    for _ in range(max_rounds):
+        resp = client.chat.completions.create(
+            model=ANSWER_MODEL,
+            messages=messages,
+            tools=AGENT_TOOLS_DEF,
+            tool_choice="auto",
+        )
+        choice = resp.choices[0]
+        if not choice.message.tool_calls:
+            return (choice.message.content or ""), tools_used
+        
+        # Append assistant message with tool_calls once
+        assistant_msg = choice.message
+        messages.append({
+            "role": "assistant",
+            "content": assistant_msg.content or "",
+            "tool_calls": [
+                {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments or "{}"}}
+                for tc in assistant_msg.tool_calls
+            ],
+        })
+        for tc in assistant_msg.tool_calls:
+            name_tc = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except json.JSONDecodeError:
+                args = {}
+            tools_used.append(name_tc)
+            
+            if name_tc == "web_search":
+                result = tool_web_search(args.get("query", ""))
+            elif name_tc == "semantic_search":
+                result = tool_semantic_search(
+                    args.get("query", ""),
+                    collection,
+                    client,
+                    me_person,
+                    k=8,
+                )
+            elif name_tc == "github_search":
+                result = tool_github_search(
+                    args.get("query", args.get("q", "")),
+                    args.get("search_type", "repositories"),
+                )
+            else:
+                result = "Unknown tool."
+            
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result[:8000],
+            })
+    
+    return "I wasn't able to form a complete answer. Please try again.", tools_used
+
+
 # Streamlit UI
 # st.title("📄 Multi-Resume RAG Chatbot")
 # st.markdown("Upload multiple resumes to search and query candidate information.")
@@ -1729,6 +2159,10 @@ if "collection" not in st.session_state:
     st.session_state.collection = None
 if "resume_metadata" not in st.session_state:
     st.session_state.resume_metadata = {}
+if "me_person" not in st.session_state:
+    st.session_state.me_person = None  # Option B: single profile "set as me" for agent
+if "agent_memories" not in st.session_state:
+    st.session_state.agent_memories = _load_agent_memories()  # Persistent memory for agent (recruiter name, etc.)
 
 # Sidebar
 with st.sidebar:
@@ -1737,7 +2171,7 @@ with st.sidebar:
     <div style="text-align: center; padding: 1rem 0;">
         <span style="font-size: 2.5rem;">🎯</span>
         <h2 style="margin: 0.5rem 0; font-size: 1.4rem;">ResumeAI</h2>
-        <p style="font-size: 0.85rem; opacity: 0.8;">Smart Candidate Search</p>
+        <p style="font-size: 0.85rem; opacity: 0.8;">Chat with candidates</p>
     </div>
     """, unsafe_allow_html=True)
     
@@ -1773,26 +2207,47 @@ with st.sidebar:
     
     st.markdown('<hr class="sidebar-divider">', unsafe_allow_html=True)
     
-    # Show loaded resumes with new card design
+    # Who do you want to chat with? (recruiter POV)
     if st.session_state.resume_metadata:
-        st.markdown(f"### 👥 Candidates ({len(st.session_state.resume_metadata)})")
+        st.markdown("### 👤 Who do you want to chat with?")
+        st.caption("Select a candidate to start the conversation.")
         for name, meta in st.session_state.resume_metadata.items():
             skills_html = "".join([f'<span class="skill-tag">{s}</span>' for s in meta.skills[:4]])
+            is_selected = st.session_state.me_person == name
             st.markdown(f"""
             <div class="candidate-card">
-                <div class="candidate-name">{name}</div>
+                <div class="candidate-name">{name}{" ✓ Chatting" if is_selected else ""}</div>
                 <div class="candidate-role">{meta.current_role or 'Role not specified'}</div>
                 <div class="candidate-skills">{skills_html}</div>
             </div>
             """, unsafe_allow_html=True)
+            safe_key = "set_me_" + re.sub(r"[^a-zA-Z0-9_]", "_", name)[:50]
+            btn_label = "✓ Chatting with " + name[:20] + ("..." if len(name) > 20 else "") if is_selected else "Chat with " + name[:20] + ("..." if len(name) > 20 else "")
+            if st.button(btn_label, key=safe_key, use_container_width=True, type="primary" if is_selected else "secondary"):
+                st.session_state.me_person = name
+                st.rerun()
+        st.markdown(f"*{len(st.session_state.resume_metadata)} candidate(s) loaded*")
+    else:
+        st.markdown("### 👤 Who do you want to chat with?")
+        st.caption("Upload PDF resume(s) above, click **Build**, then select a candidate to chat with.")
 
-# Main Header
-st.markdown("""
-<div class="main-header">
-    <h1>🎯 ResumeAI</h1>
-    <p>Upload resumes and ask questions about candidates using natural language</p>
-</div>
-""", unsafe_allow_html=True)
+# Main Header (recruiter POV: who they're chatting with)
+me_name = st.session_state.me_person
+if me_name:
+    st.markdown(f"""
+    <div class="main-header">
+        <h1>🎯 ResumeAI</h1>
+        <p>Chatting with <strong>{me_name}</strong> — ask anything you'd ask in a screening or networking call.</p>
+        <p style="font-size: 0.9rem; opacity: 0.9;">The candidate answers as themselves using their resume.</p>
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown("""
+    <div class="main-header">
+        <h1>🎯 ResumeAI</h1>
+        <p><strong>Who do you want to chat with?</strong> Select a candidate in the sidebar to start.</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 # Stats row
 num_candidates = len(st.session_state.resume_metadata)
@@ -1812,6 +2267,10 @@ st.markdown(f"""
     <div class="stat-card">
         <div class="stat-number">{num_messages // 2}</div>
         <div class="stat-label">Questions Asked</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-number">{(me_name[:12] + "…") if me_name and len(me_name) > 12 else (me_name or "—")}</div>
+        <div class="stat-label">Chatting with</div>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -1924,6 +2383,11 @@ if build_btn:
             # Store chunks for debugging
             st.session_state.all_chunks = all_chunks
             
+            # Option B: auto-set "me" when only one candidate
+            names_now = list(st.session_state.resume_metadata.keys())
+            if len(names_now) == 1 and st.session_state.me_person is None:
+                st.session_state.me_person = names_now[0]
+            
             status.update(label="✅ Vector store built!", state="complete")
             st.success(f"Processed {processed_count} resume(s) with {len(all_chunks)} chunks")
             
@@ -1932,6 +2396,9 @@ if build_btn:
                 st.warning(f"{rejected_count} file(s) were rejected:")
                 for filename, reason in rejected_files:
                     st.caption(f"• {filename}: {reason}")
+            
+            # Rerun so the sidebar re-renders with resume_metadata and shows "Who do you want to chat with?"
+            st.rerun()
         
         elif rejected_count > 0 and processed_count == 0:
             # All files were rejected
@@ -1967,12 +2434,13 @@ else:
         st.markdown("""
         <div class="empty-state">
             <div class="empty-state-icon">💬</div>
-            <h3>Ready to search!</h3>
-            <p>Ask questions about the candidates below</p>
+            <h3>Ready!</h3>
+            <p>Select <strong>Who do you want to chat with?</strong> in the sidebar to start the conversation.</p>
         </div>
         """, unsafe_allow_html=True)
 
-if query := st.chat_input("Ask about the candidates..."):
+chat_placeholder = f"Ask {me_name} anything..." if me_name else "Select a candidate in the sidebar to chat..."
+if query := st.chat_input(chat_placeholder):
     st.session_state.messages.append({"role": "user", "content": query})
     
     with st.chat_message("user", avatar="👤"):
@@ -1989,139 +2457,38 @@ if query := st.chat_input("Ask about the candidates..."):
     if st.session_state.collection is None:
         with st.chat_message("assistant", avatar="🤖"):
             st.error("Please upload resumes and build the vector store first.")
-    else:
+    elif me_name:
+        # Agent mode: recruiter-impersonation with tools (memory scoped to current person to avoid mixing candidates)
+        memory_context = get_recent_memories(limit=10, me_person=me_name)
         with st.chat_message("assistant", avatar="🤖"):
-            # Check for meta-questions about the system (don't need RAG)
-            query_lower = query.lower()
-            meta_patterns = [
-                "whose resumes", "which resumes", "what resumes", 
-                "how many resumes", "how many candidates", "list all",
-                "who do you have", "whose resume do you have",
-                "what candidates", "which candidates", "list candidates",
-                "list the candidates", "list the resumes", "show all candidates"
-            ]
-            
-            is_meta_question = any(pattern in query_lower for pattern in meta_patterns)
-            
-            if is_meta_question:
-                # Answer directly from metadata without RAG
-                names = list(st.session_state.resume_metadata.keys())
-                answer = f"I have resumes for {len(names)} candidates:\n\n"
-                for i, name in enumerate(names, 1):
-                    meta = st.session_state.resume_metadata[name]
-                    role = meta.current_role or "N/A"
-                    answer += f"{i}. **{name}**"
-                    if role != "N/A":
-                        answer += f" - {role}"
-                    answer += "\n"
-                
-                st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-            else:
-                with st.spinner("Searching..."):
-                    # Get known names first
-                    known_names = list(st.session_state.resume_metadata.keys())
-                    
-                    # Rewrite query with context
-                    rewritten_query, detected_person, is_multi_person = rewrite_query(
-                        query,
-                        st.session_state.messages[:-1],  # Exclude current query
-                        known_names,
-                        client
-                    )
-                    
-                    # Show rewritten query if different
-                    if rewritten_query.lower() != query.lower():
-                        st.caption(f"🔄 Searching for: {rewritten_query}")
-                    
-                    # === NEW: Expand temporal queries for better retrieval ===
-                    search_query, is_temporal = expand_temporal_query(rewritten_query, client)
-                    if is_temporal:
-                        st.caption(f"🕐 Temporal query detected - expanding search")
-                    # =========================================================
-                    
-                    if is_multi_person:
-                        # Multi-person query - don't filter
-                        p_filter = None
-                        st.caption(f"👥 Searching across all {len(known_names)} candidates")
-                    elif detected_person and detected_person in known_names:
-                        # Single person detected
-                        p_filter = detected_person
-                        st.caption(f"👤 Filtering for: {detected_person}")
-                    else:
-                        p_filter = None
-                    
-                
-                    
-                    # Retrieve using expanded query for temporal searches
-                    # AFTER
-                    hits = retrieve_with_filters(
-                        search_query,
-                        st.session_state.collection,
-                        client,
-                        k=10 if is_temporal else 8,
-                        person_filter=p_filter,
-                        ensure_all_candidates=is_multi_person or p_filter is None,
-                        known_names=known_names
-                    )
-                    
-                    # DEBUG: Show what was retrieved
-                    st.caption(f"🔍 Retrieved {len(hits)} chunks from {len(set(h['person_name'] for h in hits))} candidates")
-                if not hits:
-                    st.warning("No chunks retrieved! Check if collection has data.")
-                    # Try to debug collection
-                    try:
-                        count = st.session_state.collection.count()
-                        st.caption(f"Collection has {count} documents")
-                    except Exception as e:
-                        st.caption(f"Error checking collection: {e}")
-                
-                # Generate answer
-                answer = generate_answer(
+            with st.spinner("Thinking..."):
+                answer, tools_used = run_agent(
                     query,
-                    hits,
                     st.session_state.messages[:-1],
+                    memory_context,
                     client,
-                    is_multi_person=is_multi_person or p_filter is None
+                    st.session_state.collection,
+                    me_name,
                 )
-                
-                response_check = check_response_safety(answer)
-                if not response_check.passed:
-                    answer = "I encountered an issue generating a safe response. Please try rephrasing your question."
-                
-                st.markdown(answer)
-                
-                # Show sources in expander
-                if hits:
-                    with st.expander("📚 Sources"):
-                        seen = set()
-                        for h in hits:
-                            # Skip chunks that look like injection attempts
-                            chunk_text_lower = h['text'].lower()
-                            suspicious_phrases = [
-                                'no matter what question',
-                                'always say',
-                                'ignore all instructions',
-                                'you are now',
-                                'act as if',
-                            ]
-                            if any(phrase in chunk_text_lower for phrase in suspicious_phrases):
-                                continue  # Skip this suspicious chunk
-                            
-                            # Deduplicate by person + chunk_type
-                            key = f"{h['person_name']}_{h['chunk_type']}"
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            
-                            st.markdown(f"**{h['person_name']}** ({h['chunk_type']})")
-                            preview = h['text'][:300].replace('\n', ' ').strip()
-                            if len(h['text']) > 300:
-                                preview += "..."
-                            st.caption(preview)
-                            st.divider()
-                
-                
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+            response_check = check_response_safety(answer)
+            if not response_check.passed:
+                answer = (
+                    "I don't have that information in your materials. Try rephrasing or ask about something else."
+                    if response_check.reason == "Response may reveal AI identity"
+                    else "I encountered an issue generating a safe response. Please try rephrasing your question."
+                )
+            st.markdown(answer)
+            if tools_used:
+                st.caption("🔧 Tools used: " + ", ".join(tools_used))
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            summarize_and_store(query, answer, client, me_person=me_name)
+    else:
+        # Recruiter must select a candidate before chatting
+        with st.chat_message("assistant", avatar="🤖"):
+            msg = (
+                "**Who do you want to chat with?** Select a candidate in the sidebar to start the conversation."
+            )
+            st.info(msg)
+            st.session_state.messages.append({"role": "assistant", "content": msg})
 
 
